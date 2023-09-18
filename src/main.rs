@@ -1,12 +1,14 @@
 #[macro_use] extern crate rocket;
+use mongodb::results::InsertOneResult;
 use mongodb::{Client, options::ClientOptions};
 // use mongodb::bson::extjson::de::Error;
 // use mongodb::bson::{doc, Document};
-use mongodb::Collection;
+// use mongodb::Collection;
 use mongodb::error::Error;
 use futures::stream::TryStreamExt;
 use rocket::http::Status;
 use rocket::serde::{Serialize, Deserialize, json::Json};
+use rocket::request::{self, Outcome, Request, FromRequest};
 
 // https://www.mongodb.com/developer/languages/rust/serde-improvements/
 
@@ -58,9 +60,9 @@ async fn fetch_books() -> Result<Option<Book>, Error> {
 
     let mut cursor = books.find(None, None).await?;
 
-    while let Some(book) = cursor.try_next().await? {
+    /* while let Some(book) = cursor.try_next().await? {
         println!("book: {:?}", book);
-    }
+    } */
 
     let book = books.find_one(None, None).await;
 
@@ -133,13 +135,75 @@ async fn fetch_tasks() ->Result<Vec<Task>, Error> { // Result<Vec<Task>, Error>
     Ok(tasks_list)
 }
 
+async fn create_task(task_data: Task) -> Result<InsertOneResult, Error> { // Result<Vec<Task>, Error>
+    println!("task_data {:?}", task_data);
+    let mut client_options = ClientOptions::parse("mongodb://localhost:27017").await?;
+    client_options.app_name = Some("mossy".to_string());
+    let client = Client::with_options(client_options)?;
+
+    for db_name in client.list_database_names(None, None).await? {
+        println!("db_name: {}", db_name);
+    }
+
+    let db = client.database("mossy");
+
+    for collection_name in db.list_collection_names(None).await? {
+        println!("collection_name: {}", collection_name);
+    }
+
+    let tasks = db.collection::<Task>("tasks");
+
+    // let cursor = tasks.find(None, None).await?;
+
+    let task_result = tasks.insert_one(task_data, None).await;
+
+    /* let mut tasks_list = Vec::new();
+
+    while let Some(task) = cursor.try_next().await? {
+        println!("task: {:?}", task);
+        tasks_list.push(task);
+    } */
+
+    /* let docs = vec![    
+        Book { title: "1984".to_string(), author: "George Orwell".to_string() },
+        Book { title: "Animal Farm".to_string(), author: "George Orwell".to_string() },
+        Book { title: "The Great Gatsby".to_string(), author: "F. Scott Fitzgerald".to_string() },
+    ]; */
+
+    // Disable insert since we have a LOT of books by now
+    // We should figure out how to get a count of all records
+    // books.insert_many(docs, None).await?;
+
+    // let task = tasks.find_one(None, None).await;
+
+    match task_result {
+        Ok(_task_result) => Ok(_task_result),
+        Err(_) => todo!(),
+    }
+    /* match tasks_list {
+        Ok(tasks_list_result) => Ok(tasks_list_result),
+        Err(_) => todo!(),
+    } */
+    // Ok(tasks_list)
+}
+
 #[get("/api/tasks", format="json")]
 async fn get_tasks_list() -> Result<Json<Vec<Task>>, Status> {
     let tasks = fetch_tasks().await;
-    // println!("Found tasks:");
-    // println!("task {:?}", task);
 
     match tasks {
+        Ok(task_result) => Ok(Json(task_result)),
+        Err(_) => Err(Status::InternalServerError),
+    }
+}
+
+#[post("/api/tasks", format="json", data="<task>")]
+async fn post_task(task: Json<Task>) -> Result<Json<InsertOneResult>, Status> {
+    let deserialized_task = task.into_inner();
+    println!("deserialized_task {:?}", deserialized_task);
+    let task = create_task(deserialized_task).await;
+
+    match task {
         Ok(task_result) => Ok(Json(task_result)),
         Err(_) => Err(Status::InternalServerError),
     }
@@ -151,4 +215,5 @@ fn rocket() -> _ {
         .mount("/", routes![index])
         .mount("/", routes![get_books_list])
         .mount("/", routes![get_tasks_list])
+        .mount("/", routes![post_task])
 }
