@@ -94,7 +94,7 @@ async fn get_books_list() -> Result<Json<Option<Book>>, Status> {
     }
 }
 
-async fn fetch_tasks() -> Result<Option<Task>, Error> {
+async fn fetch_tasks() ->Result<Vec<Task>, Error> { // Result<Vec<Task>, Error>
     let mut client_options = ClientOptions::parse("mongodb://localhost:27017").await?;
     client_options.app_name = Some("mossy".to_string());
     let client = Client::with_options(client_options)?;
@@ -111,37 +111,35 @@ async fn fetch_tasks() -> Result<Option<Task>, Error> {
 
     let tasks = db.collection::<Task>("tasks");
 
-    /* let docs = vec![    
-        Book { title: "1984".to_string(), author: "George Orwell".to_string() },
-        Book { title: "Animal Farm".to_string(), author: "George Orwell".to_string() },
-        Book { title: "The Great Gatsby".to_string(), author: "F. Scott Fitzgerald".to_string() },
-    ]; */
-
-    // Disable insert since we have a LOT of books by now
-    // We should figure out how to get a count of all records
-    // books.insert_many(docs, None).await?;
-
     let mut cursor = tasks.find(None, None).await?;
+
+    let mut tasks_list = Vec::new();
 
     while let Some(task) = cursor.try_next().await? {
         println!("task: {:?}", task);
+        tasks_list.push(task);
     }
 
-    let task = tasks.find_one(None, None).await;
+    // let task = tasks.find_one(None, None).await;
 
-    match task {
+    /* match task {
         Ok(task_result) => Ok(task_result),
         Err(_) => todo!(),
-    }
+    } */
+    /* match tasks_list {
+        Ok(tasks_list_result) => Ok(tasks_list_result),
+        Err(_) => todo!(),
+    } */
+    Ok(tasks_list)
 }
 
 #[get("/api/tasks", format="json")]
-async fn get_tasks_list() -> Result<Json<Option<Task>>, Status> {
-    let task = fetch_tasks().await;
-    println!("Found task:");
-    println!("task {:?}", task);
+async fn get_tasks_list() -> Result<Json<Vec<Task>>, Status> {
+    let tasks = fetch_tasks().await;
+    // println!("Found tasks:");
+    // println!("task {:?}", task);
 
-    match task {
+    match tasks {
         Ok(task_result) => Ok(Json(task_result)),
         Err(_) => Err(Status::InternalServerError),
     }
