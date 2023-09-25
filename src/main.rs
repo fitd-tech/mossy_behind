@@ -6,6 +6,7 @@ use futures::stream::TryStreamExt;
 use rocket::http::Status;
 use rocket::serde::{Serialize, Deserialize, json::Json};
 use mongodb::bson;
+use mongodb::options::FindOneOptions;
 
 // https://www.mongodb.com/developer/languages/rust/serde-improvements/
 
@@ -32,12 +33,36 @@ struct Task {
     frequency: i32,
 }
 
+#[derive(Serialize, Deserialize, Debug)]
+#[serde(crate = "rocket::serde")]
+struct TaskWithLatestEvent {
+    _id: bson::oid::ObjectId,
+    name: String,
+    frequency: i32,
+    latest_event_date: Option<String>,
+}
+
+#[derive(Serialize, Deserialize, Debug)]
+#[serde(crate = "rocket::serde")]
+struct Event {
+    _id: bson::oid::ObjectId,
+    task: bson::oid::ObjectId,
+    date: String,
+}
+
+#[derive(Serialize, Deserialize, Debug)]
+#[serde(crate = "rocket::serde")]
+struct NewEventData {
+    task: bson::oid::ObjectId,
+    date: String,
+}
+
 #[get("/")]
 async fn index() -> &'static str {
     return "Hello, world!";
 }
 
-async fn read_tasks_list_action() ->Result<Vec<Task>, Error> {
+async fn read_tasks_list_action() ->Result<Vec<TaskWithLatestEvent>, Error> {
     let mut client_options = ClientOptions::parse("mongodb://localhost:27017").await?;
     client_options.app_name = Some("mossy".to_string());
     let client = Client::with_options(client_options)?;
@@ -53,6 +78,7 @@ async fn read_tasks_list_action() ->Result<Vec<Task>, Error> {
     }
 
     let tasks = db.collection::<Task>("tasks");
+    let events = db.collection::<Event>("events");
 
     let mut cursor = tasks.find(None, None).await?;
 
@@ -60,9 +86,39 @@ async fn read_tasks_list_action() ->Result<Vec<Task>, Error> {
 
     while let Some(task) = cursor.try_next().await? {
         println!("task: {:?}", task);
-        tasks_list.push(task);
+        let filter = bson::doc! {
+            "task": task._id,
+        };
+        let sort_option = bson::doc! {
+            "date": -1,
+        };
+        let options = FindOneOptions::builder().sort(sort_option).build();
+        let latest_event = events.find_one(filter, options).await?;
+        /* let latest_event_or_null = match latest_event {
+            Some(_latest_event) => _latest_event,
+            None => continue // I think this prevents the code from progressing beyond this point
+        }; */
+        // println!("latest_event {:?}", latest_event);
+
+        let task_with_latest_event = match latest_event {
+            Some(_latest_event) => TaskWithLatestEvent {
+                _id: task._id,
+                name: task.name,
+                frequency: task.frequency,
+                latest_event_date: Some(_latest_event.date),
+            },
+            None => TaskWithLatestEvent {
+                _id: task._id,
+                name: task.name,
+                frequency: task.frequency,
+                latest_event_date: None,
+            }
+        };
+        println!("task_with_latest_event {:?}", task_with_latest_event);
+        tasks_list.push(task_with_latest_event);
     }
 
+    println!("tasks_list {:?}", tasks_list);
     Ok(tasks_list)
 }
 
@@ -164,8 +220,44 @@ async fn delete_tasks_action(tasks_data: Vec<bson::oid::ObjectId>) -> Result<Del
     }
 }
 
+async fn create_event_action(event_data: NewEventData) -> Result<InsertOneResult, Error> {
+    println!("event_data {:?}", event_data);
+    let mut client_options = ClientOptions::parse("mongodb://localhost:27017").await?;
+    client_options.app_name = Some("mossy".to_string());
+    let client = Client::with_options(client_options)?;
+
+    for db_name in client.list_database_names(None, None).await? {
+        println!("db_name: {}", db_name);
+    }
+
+    let db = client.database("mossy");
+
+    for collection_name in db.list_collection_names(None).await? {
+        println!("collection_name: {}", collection_name);
+    }
+
+    let events = db.collection::<Event>("events");
+
+    println!("event_data.date {:?}", event_data.date);
+    // let event_date: chrono::DateTime<Utc> = event_data.date.parse().unwrap();
+
+    let new_event = Event {
+        _id: bson::oid::ObjectId::new(),
+        task: event_data.task,
+        date: event_data.date,
+    };
+    println!("new_event: {:?}", new_event);
+
+    let event_result = events.insert_one(new_event, None).await;
+
+    match event_result {
+        Ok(_event_result) => Ok(_event_result),
+        Err(_) => todo!(),
+    }
+}
+
 #[get("/api/tasks", format="json")]
-async fn read_tasks_list() -> Result<Json<Vec<Task>>, Status> {
+async fn read_tasks_list() -> Result<Json<Vec<TaskWithLatestEvent>>, Status> {
     let tasks = read_tasks_list_action().await;
 
     match tasks {
@@ -210,6 +302,18 @@ async fn delete_tasks(tasks: Json<Vec<bson::oid::ObjectId>>) -> Result<Json<Dele
     }
 }
 
+#[post("/api/events", format="json", data="<event>")]
+async fn create_event(event: Json<NewEventData>) -> Result<Json<InsertOneResult>, Status> {
+    let deserialized_event = event.into_inner();
+    println!("deserialized_event {:?}", deserialized_event);
+    let event = create_event_action(deserialized_event).await;
+
+    match event {
+        Ok(event_result) => Ok(Json(event_result)),
+        Err(_) => Err(Status::InternalServerError),
+    }
+}
+
 #[launch]
 fn rocket() -> _ {
     rocket::build()
@@ -218,4 +322,5 @@ fn rocket() -> _ {
         .mount("/", routes![create_task])
         .mount("/", routes![update_task])
         .mount("/", routes![delete_tasks])
+        .mount("/", routes![create_event])
 }
