@@ -6,7 +6,7 @@ use futures::stream::TryStreamExt;
 use rocket::http::Status;
 use rocket::serde::{Serialize, Deserialize, json::Json};
 use mongodb::bson;
-use mongodb::options::FindOneOptions;
+use mongodb::options::{FindOptions, FindOneOptions};
 
 // https://www.mongodb.com/developer/languages/rust/serde-improvements/
 
@@ -52,6 +52,14 @@ struct Event {
 
 #[derive(Serialize, Deserialize, Debug)]
 #[serde(crate = "rocket::serde")]
+struct EventWithStringValues {
+    _id: bson::oid::ObjectId,
+    task: Option<String>,
+    date: String,
+}
+
+#[derive(Serialize, Deserialize, Debug)]
+#[serde(crate = "rocket::serde")]
 struct NewEventData {
     task: bson::oid::ObjectId,
     date: String,
@@ -62,7 +70,7 @@ async fn index() -> &'static str {
     return "Hello, world!";
 }
 
-async fn read_tasks_list_action() ->Result<Vec<TaskWithLatestEvent>, Error> {
+async fn read_tasks_action() ->Result<Vec<TaskWithLatestEvent>, Error> {
     let mut client_options = ClientOptions::parse("mongodb://localhost:27017").await?;
     client_options.app_name = Some("mossy".to_string());
     let client = Client::with_options(client_options)?;
@@ -94,11 +102,6 @@ async fn read_tasks_list_action() ->Result<Vec<TaskWithLatestEvent>, Error> {
         };
         let options = FindOneOptions::builder().sort(sort_option).build();
         let latest_event = events.find_one(filter, options).await?;
-        /* let latest_event_or_null = match latest_event {
-            Some(_latest_event) => _latest_event,
-            None => continue // I think this prevents the code from progressing beyond this point
-        }; */
-        // println!("latest_event {:?}", latest_event);
 
         let task_with_latest_event = match latest_event {
             Some(_latest_event) => TaskWithLatestEvent {
@@ -120,6 +123,93 @@ async fn read_tasks_list_action() ->Result<Vec<TaskWithLatestEvent>, Error> {
 
     println!("tasks_list {:?}", tasks_list);
     Ok(tasks_list)
+}
+
+async fn read_events_action() ->Result<Vec<Event>, Error> {
+    let mut client_options = ClientOptions::parse("mongodb://localhost:27017").await?;
+    client_options.app_name = Some("mossy".to_string());
+    let client = Client::with_options(client_options)?;
+
+    for db_name in client.list_database_names(None, None).await? {
+        println!("db_name: {}", db_name);
+    }
+
+    let db = client.database("mossy");
+
+    for collection_name in db.list_collection_names(None).await? {
+        println!("collection_name: {}", collection_name);
+    }
+
+    let events = db.collection::<Event>("events");
+
+    let sort_option = bson::doc! {
+        "date": -1,
+    };
+    let options = FindOptions::builder().sort(sort_option).build();
+    let mut cursor = events.find(None, options).await?;
+
+    let mut events_list = Vec::new();
+
+    while let Some(event) = cursor.try_next().await? {
+        println!("event: {:?}", event);
+        events_list.push(event);
+    }
+
+    println!("events_list {:?}", events_list);
+    Ok(events_list)
+}
+
+async fn read_events_string_action() ->Result<Vec<EventWithStringValues>, Error> {
+    let mut client_options = ClientOptions::parse("mongodb://localhost:27017").await?;
+    client_options.app_name = Some("mossy".to_string());
+    let client = Client::with_options(client_options)?;
+
+    for db_name in client.list_database_names(None, None).await? {
+        println!("db_name: {}", db_name);
+    }
+
+    let db = client.database("mossy");
+
+    for collection_name in db.list_collection_names(None).await? {
+        println!("collection_name: {}", collection_name);
+    }
+
+    let events = db.collection::<Event>("events");
+    let tasks = db.collection::<Task>("tasks");
+
+    let sort_option = bson::doc! {
+        "date": -1,
+    };
+    let options = FindOptions::builder().sort(sort_option).build();
+    let mut cursor = events.find(None, options).await?;
+
+    let mut events_list = Vec::new();
+
+    while let Some(event) = cursor.try_next().await? {
+        println!("event: {:?}", event);
+        let filter = bson::doc! {
+            "_id": event.task,
+        };
+        let task = tasks.find_one(filter, None).await?;
+
+        let event_with_string_values = match task {
+            Some(_task) => EventWithStringValues {
+                _id: event._id,
+                task: Some(_task.name),
+                date: event.date,
+            },
+            None => EventWithStringValues {
+                _id: event._id,
+                task: None,
+                date: event.date,
+            }
+        };
+        println!("event_with_string_values {:?}", event_with_string_values);
+        events_list.push(event_with_string_values);
+    }
+
+    println!("events_list {:?}", events_list);
+    Ok(events_list)
 }
 
 async fn create_task_action(task_data: NewTaskData) -> Result<InsertOneResult, Error> {
@@ -151,71 +241,6 @@ async fn create_task_action(task_data: NewTaskData) -> Result<InsertOneResult, E
 
     match task_result {
         Ok(_task_result) => Ok(_task_result),
-        Err(_) => todo!(),
-    }
-}
-
-async fn update_task_action(task_data: Task) -> Result<UpdateResult, Error> {
-    println!("task_data {:?}", task_data);
-    let mut client_options = ClientOptions::parse("mongodb://localhost:27017").await?;
-    client_options.app_name = Some("mossy".to_string());
-    let client = Client::with_options(client_options)?;
-
-    for db_name in client.list_database_names(None, None).await? {
-        println!("db_name: {}", db_name);
-    }
-
-    let db = client.database("mossy");
-
-    for collection_name in db.list_collection_names(None).await? {
-        println!("collection_name: {}", collection_name);
-    }
-
-    let tasks = db.collection::<Task>("tasks");
-
-    let updated_task = bson::doc! {
-        "$set": {
-            "name": task_data.name,
-            "frequency": task_data.frequency,
-        }
-    };
-    println!("new_task: {:?}", updated_task);
-
-    let filter = bson::doc!{"_id": task_data._id };
-
-    let task_result = tasks.update_one(filter, updated_task, None).await;
-    println!("task_result {:?}", task_result);
-
-    match task_result {
-        Ok(_task_result) => Ok(_task_result),
-        Err(_) => todo!(),
-    }
-}
-
-async fn delete_tasks_action(tasks_data: Vec<bson::oid::ObjectId>) -> Result<DeleteResult, Error> {
-    println!("task_data {:?}", tasks_data);
-    let mut client_options = ClientOptions::parse("mongodb://localhost:27017").await?;
-    client_options.app_name = Some("mossy".to_string());
-    let client = Client::with_options(client_options)?;
-
-    for db_name in client.list_database_names(None, None).await? {
-        println!("db_name: {}", db_name);
-    }
-
-    let db = client.database("mossy");
-
-    for collection_name in db.list_collection_names(None).await? {
-        println!("collection_name: {}", collection_name);
-    }
-
-    let tasks = db.collection::<Task>("tasks");
-
-    let filter = bson::doc!{"_id": { "$in": tasks_data }};
-
-    let tasks_result = tasks.delete_many(filter, None).await;
-
-    match tasks_result {
-        Ok(_tasks_result) => Ok(_tasks_result),
         Err(_) => todo!(),
     }
 }
@@ -256,12 +281,141 @@ async fn create_event_action(event_data: NewEventData) -> Result<InsertOneResult
     }
 }
 
+async fn update_task_action(task_data: Task) -> Result<UpdateResult, Error> {
+    println!("task_data {:?}", task_data);
+    let mut client_options = ClientOptions::parse("mongodb://localhost:27017").await?;
+    client_options.app_name = Some("mossy".to_string());
+    let client = Client::with_options(client_options)?;
+
+    for db_name in client.list_database_names(None, None).await? {
+        println!("db_name: {}", db_name);
+    }
+
+    let db = client.database("mossy");
+
+    for collection_name in db.list_collection_names(None).await? {
+        println!("collection_name: {}", collection_name);
+    }
+
+    let tasks = db.collection::<Task>("tasks");
+
+    let updated_task = bson::doc! {
+        "$set": {
+            "name": task_data.name,
+            "frequency": task_data.frequency,
+        }
+    };
+    println!("updated_task: {:?}", updated_task);
+
+    let filter = bson::doc!{"_id": task_data._id };
+
+    let task_result = tasks.update_one(filter, updated_task, None).await;
+    println!("task_result {:?}", task_result);
+
+    match task_result {
+        Ok(_task_result) => Ok(_task_result),
+        Err(_) => todo!(),
+    }
+}
+
+async fn update_event_action(event_data: EventWithStringValues) -> Result<UpdateResult, Error> {
+    println!("event_data {:?}", event_data);
+    let mut client_options = ClientOptions::parse("mongodb://localhost:27017").await?;
+    client_options.app_name = Some("mossy".to_string());
+    let client = Client::with_options(client_options)?;
+
+    for db_name in client.list_database_names(None, None).await? {
+        println!("db_name: {}", db_name);
+    }
+
+    let db = client.database("mossy");
+
+    for collection_name in db.list_collection_names(None).await? {
+        println!("collection_name: {}", collection_name);
+    }
+
+    let events = db.collection::<Event>("events");
+
+    let updated_event = bson::doc! {
+        "$set": {
+            "date": event_data.date,
+        }
+    };
+    println!("updated_event: {:?}", updated_event);
+
+    let filter = bson::doc!{"_id": event_data._id };
+
+    let event_result = events.update_one(filter, updated_event, None).await;
+    println!("event_result {:?}", event_result);
+
+    match event_result {
+        Ok(_event_result) => Ok(_event_result),
+        Err(_) => todo!(),
+    }
+}
+
+async fn delete_tasks_action(tasks_data: Vec<bson::oid::ObjectId>) -> Result<DeleteResult, Error> {
+    println!("task_data {:?}", tasks_data);
+    let mut client_options = ClientOptions::parse("mongodb://localhost:27017").await?;
+    client_options.app_name = Some("mossy".to_string());
+    let client = Client::with_options(client_options)?;
+
+    for db_name in client.list_database_names(None, None).await? {
+        println!("db_name: {}", db_name);
+    }
+
+    let db = client.database("mossy");
+
+    for collection_name in db.list_collection_names(None).await? {
+        println!("collection_name: {}", collection_name);
+    }
+
+    let tasks = db.collection::<Task>("tasks");
+
+    let filter = bson::doc!{"_id": { "$in": tasks_data }};
+
+    let tasks_result = tasks.delete_many(filter, None).await;
+
+    match tasks_result {
+        Ok(_tasks_result) => Ok(_tasks_result),
+        Err(_) => todo!(),
+    }
+}
+
+async fn delete_events_action(events_data: Vec<bson::oid::ObjectId>) -> Result<DeleteResult, Error> {
+    println!("events_data {:?}", events_data);
+    let mut client_options = ClientOptions::parse("mongodb://localhost:27017").await?;
+    client_options.app_name = Some("mossy".to_string());
+    let client = Client::with_options(client_options)?;
+
+    for db_name in client.list_database_names(None, None).await? {
+        println!("db_name: {}", db_name);
+    }
+
+    let db = client.database("mossy");
+
+    for collection_name in db.list_collection_names(None).await? {
+        println!("collection_name: {}", collection_name);
+    }
+
+    let events = db.collection::<Event>("events");
+
+    let filter = bson::doc!{"_id": { "$in": events_data }};
+
+    let events_result = events.delete_many(filter, None).await;
+
+    match events_result {
+        Ok(_events_result) => Ok(_events_result),
+        Err(_) => todo!(),
+    }
+}
+
 #[get("/api/tasks", format="json")]
-async fn read_tasks_list() -> Result<Json<Vec<TaskWithLatestEvent>>, Status> {
-    let tasks = read_tasks_list_action().await;
+async fn read_tasks() -> Result<Json<Vec<TaskWithLatestEvent>>, Status> {
+    let tasks = read_tasks_action().await;
 
     match tasks {
-        Ok(task_result) => Ok(Json(task_result)),
+        Ok(tasks_result) => Ok(Json(tasks_result)),
         Err(_) => Err(Status::InternalServerError),
     }
 }
@@ -302,6 +456,26 @@ async fn delete_tasks(tasks: Json<Vec<bson::oid::ObjectId>>) -> Result<Json<Dele
     }
 }
 
+#[get("/api/events", format="json")]
+async fn read_events() -> Result<Json<Vec<Event>>, Status> {
+    let events = read_events_action().await;
+
+    match events {
+        Ok(events_result) => Ok(Json(events_result)),
+        Err(_) => Err(Status::InternalServerError),
+    }
+}
+
+#[get("/api/events-string", format="json")]
+async fn read_events_string() -> Result<Json<Vec<EventWithStringValues>>, Status> {
+    let events = read_events_string_action().await;
+
+    match events {
+        Ok(events_result) => Ok(Json(events_result)),
+        Err(_) => Err(Status::InternalServerError),
+    }
+}
+
 #[post("/api/events", format="json", data="<event>")]
 async fn create_event(event: Json<NewEventData>) -> Result<Json<InsertOneResult>, Status> {
     let deserialized_event = event.into_inner();
@@ -314,13 +488,41 @@ async fn create_event(event: Json<NewEventData>) -> Result<Json<InsertOneResult>
     }
 }
 
+#[patch("/api/events", format="json", data="<event>")]
+async fn update_event(event: Json<EventWithStringValues>) -> Result<Json<UpdateResult>, Status> {
+    let deserialized_event = event.into_inner();
+    println!("deserialized_event {:?}", deserialized_event);
+    let event = update_event_action(deserialized_event).await;
+
+    match event {
+        Ok(event_result) => Ok(Json(event_result)),
+        Err(_) => Err(Status::InternalServerError),
+    }
+}
+
+#[delete("/api/events", format="json", data="<events>")]
+async fn delete_events(events: Json<Vec<bson::oid::ObjectId>>) -> Result<Json<DeleteResult>, Status> {
+    let deserialized_events_list = events.into_inner();
+    println!("deserialized_events {:?}", deserialized_events_list);
+    let events = delete_events_action(deserialized_events_list).await;
+
+    match events {
+        Ok(events_result) => Ok(Json(events_result)),
+        Err(_) => Err(Status::InternalServerError),
+    }
+}
+
 #[launch]
 fn rocket() -> _ {
     rocket::build()
         .mount("/", routes![index])
-        .mount("/", routes![read_tasks_list])
+        .mount("/", routes![read_tasks])
         .mount("/", routes![create_task])
         .mount("/", routes![update_task])
         .mount("/", routes![delete_tasks])
+        .mount("/", routes![read_events])
+        .mount("/", routes![read_events_string])
         .mount("/", routes![create_event])
+        .mount("/", routes![update_event])
+        .mount("/", routes![delete_events])
 }
