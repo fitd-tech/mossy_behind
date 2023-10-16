@@ -7,6 +7,12 @@ use rocket::http::Status;
 use rocket::serde::{Serialize, Deserialize, json::Json};
 use mongodb::bson;
 use mongodb::options::{FindOptions, FindOneOptions};
+use reqwest;
+use reqwest::Error as ReqwestError;
+use base64::{Engine as _, engine::general_purpose};
+use jsonwebtoken;
+use jsonwebtoken::{DecodingKey, Validation, Algorithm};
+use dotenv;
 
 // https://www.mongodb.com/developer/languages/rust/serde-improvements/
 
@@ -16,6 +22,71 @@ struct Book {
     _id: bson::oid::ObjectId,
     title: String,
     author: String,
+}
+
+#[derive(Serialize, Deserialize, Debug)]
+#[serde(crate = "rocket::serde")]
+struct Credentials {
+    authorization_code: String,
+    identity_token: String,
+    nonce: String,
+    user: String,
+}
+
+#[derive(Serialize, Deserialize, Debug)]
+#[serde(crate = "rocket::serde")]
+struct AppleAuthKey {
+    alg: String,
+    e: String,
+    kid: String,
+    kty: String,
+    n: String,
+    #[serde(rename = "use")]
+    use_alias: String,
+}
+
+#[derive(Serialize, Deserialize, Debug)]
+#[serde(crate = "rocket::serde")]
+struct AppleAuthResponse {
+    keys: Vec<AppleAuthKey>
+}
+
+#[derive(Serialize, Deserialize, Debug)]
+#[serde(crate = "rocket::serde")]
+struct DecodedKeys {
+    kid: String,
+    decoded_e: Vec<u8>,
+    decoded_n: Vec<u8>,
+}
+
+#[derive(Serialize, Deserialize, Debug)]
+#[serde(crate = "rocket::serde")]
+struct Claims {
+    iss: String,
+    aud: String,
+    exp: i64,
+    iat: i64,
+    sub: String,
+    c_hash: String,
+    email: String,
+    email_verified: String,
+    auth_time: i64,
+    nonce_supported: bool,
+    nonce: Option<String>,
+}
+
+#[derive(Serialize, Deserialize, Debug)]
+#[serde(crate = "rocket::serde")]
+struct User {
+    _id: bson::oid::ObjectId,
+    email: String,
+    apple_user_id: String,
+}
+
+#[derive(Serialize, Deserialize, Debug)]
+#[serde(crate = "rocket::serde")]
+struct UserData {
+    apple_user_id: String,
 }
 
 #[derive(Serialize, Deserialize, Debug)]
@@ -85,12 +156,175 @@ struct NewEventData {
     date: String,
 }
 
+#[derive(Debug)]
+enum CredentialsError {
+    FetchKeysError(ReqwestError),
+    DotEnvError,
+    NoClientIdError,
+    NoDbAddressError,
+    DeserializeJsonError,
+    DecodeJwtError,
+    NoKidError,
+    NoMatchingKidError,
+    InvalidKeySucceededError,
+    MatchingKeyFailedError,
+    DecodeComponentError,
+    InvalidNonceError,
+    DatabaseError,
+}
+
 #[get("/")]
 async fn index() -> &'static str {
     return "Hello, world!";
 }
 
-async fn read_tasks_action() ->Result<Vec<TaskWithLatestEvent>, Error> {
+// https://developer.apple.com/documentation/sign_in_with_apple/fetch_apple_s_public_key_for_verifying_token_signature
+// https://stackoverflow.com/questions/66067321/marshal-appleids-public-key-to-rsa-publickey
+// https://developer.apple.com/documentation/sign_in_with_apple/sign_in_with_apple_rest_api/verifying_a_user
+// https://jwt.io/ to decode JWT
+async fn validate_credentials(credentials: Credentials) -> Result<Claims, CredentialsError> {
+    let keys_response = match reqwest::get("https://appleid.apple.com/auth/keys").await {
+        Ok(_keys_response) => _keys_response,
+        Err(_keys_response) => return Err(CredentialsError::FetchKeysError(_keys_response))
+    };
+    let deserialized_keys_response = match keys_response.json::<AppleAuthResponse>().await {
+        Ok(_deserialized_keys_response) => _deserialized_keys_response,
+        Err(_deserialized_keys_response) => return Err(CredentialsError::DeserializeJsonError)
+    };
+
+    let credential_header = match jsonwebtoken::decode_header(&credentials.identity_token) {
+        Ok(_credential_header) => _credential_header,
+        Err(_credential_header) => return Err(CredentialsError::DecodeJwtError)
+    };
+    let Some(credential_kid) = credential_header.kid else {
+        return Err(CredentialsError::NoKidError)
+    };
+
+    let _dotenv_result = match dotenv::dotenv() {
+        Ok(_dotenv_result) => _dotenv_result,
+        Err(_) => return Err(CredentialsError::DotEnvError),
+    };
+    let apple_client_id = match dotenv::var("APPLE_CLIENT_ID") {
+        Ok(_apple_client_id) => _apple_client_id,
+        Err(_) => return Err(CredentialsError::NoClientIdError)
+    };
+
+    // We can specify validation predicates here per this list:
+    // https://developer.apple.com/documentation/sign_in_with_apple/sign_in_with_apple_rest_api/verifying_a_user
+    let mut validation = Validation::new(Algorithm::RS256);
+    validation.set_issuer(&["https://appleid.apple.com"]);
+    validation.set_audience(&[apple_client_id]);
+
+    let mut keys_iterator = deserialized_keys_response.keys.into_iter();
+    let Some(matching_key) = keys_iterator.find(|key| key.kid == credential_kid) else {
+        return Err(CredentialsError::NoMatchingKidError)
+    };
+
+    // Make sure an invalid key fails, if one exists in the response
+    if let Some(invalid_key) = keys_iterator.find(|key| key.kid != credential_kid) {
+        let decoded_n = match general_purpose::URL_SAFE_NO_PAD.decode(invalid_key.n) {
+            Ok(_decoded_n) => _decoded_n,
+            Err(_decoded_n) => return Err(CredentialsError::DecodeComponentError)
+        };
+        let decoded_e = match general_purpose::URL_SAFE_NO_PAD.decode(invalid_key.e) {
+            Ok(_decoded_e) => _decoded_e,
+            Err(_decoded_e) => return Err(CredentialsError::DecodeComponentError)
+        };
+        let decoding_key = DecodingKey::from_rsa_raw_components(&decoded_n, &decoded_e);
+        let _claims = match jsonwebtoken::decode::<Claims>(&credentials.identity_token, &decoding_key, &validation) {
+            Ok(_) => return Err(CredentialsError::InvalidKeySucceededError),
+            Err(_) => println!("Invalid key failed as expected! 👍"),
+        };
+    };
+
+    let decoded_n = match general_purpose::URL_SAFE_NO_PAD.decode(matching_key.n) {
+        Ok(_decoded_n) => _decoded_n,
+        Err(_decoded_n) => return Err(CredentialsError::DecodeComponentError)
+    };
+    let decoded_e = match general_purpose::URL_SAFE_NO_PAD.decode(matching_key.e) {
+        Ok(_decoded_e) => _decoded_e,
+        Err(_decoded_e) => return Err(CredentialsError::DecodeComponentError)
+    };
+    let decoding_key = DecodingKey::from_rsa_raw_components(&decoded_n, &decoded_e);
+    let claims = match jsonwebtoken::decode::<Claims>(&credentials.identity_token, &decoding_key, &validation) {
+        Ok(_claims) => _claims,
+        Err(_claims) => return Err(CredentialsError::MatchingKeyFailedError),
+    };
+
+    let Some(claims_nonce) = &claims.claims.nonce else {
+        return Err(CredentialsError::InvalidNonceError)
+    };
+    if *claims_nonce != credentials.nonce {
+        return Err(CredentialsError::InvalidNonceError)
+    }
+
+    let mongodb_address = match dotenv::var("MONGODB_ADDRESS") {
+        Ok(_mongodb_address) => _mongodb_address,
+        Err(_) => return Err(CredentialsError::NoDbAddressError)
+    };
+    
+    let mut client_options = match ClientOptions::parse(mongodb_address).await {
+        Ok(_client_options) => _client_options,
+        Err(_) => return Err(CredentialsError::DatabaseError)
+    };
+    client_options.app_name = Some("mossy".to_string());
+    let client = match Client::with_options(client_options) {
+        Ok(_client) => _client,
+        Err(_) => return Err(CredentialsError::DatabaseError)
+    };
+    let db = client.database("mossy");
+
+    let users = db.collection::<User>("users");
+
+    let filter = bson::doc! {
+        "apple_user_id": credentials.user.clone(),
+    };
+    let existing_user_option = match users.find_one(filter, None).await {
+        Ok(_existing_user) => _existing_user,
+        Err(_existing_user) => return Err(CredentialsError::DatabaseError)
+    };
+    if existing_user_option.is_none() {
+        let email_copy = claims.claims.email.clone();
+        let user_copy = credentials.user.clone();
+        let new_user = User {
+            _id: bson::oid::ObjectId::new(),
+            email: email_copy,
+            apple_user_id: user_copy,
+        };
+        match users.insert_one(new_user, None).await {
+            Ok(_user_result) => _user_result,
+            Err(_) => return Err(CredentialsError::DatabaseError)
+        };
+    }
+    
+    Ok(claims.claims)
+}
+
+async fn read_user_action(user_data: UserData) -> Result<User, Error> {
+    let mut client_options = ClientOptions::parse("mongodb://localhost:27017").await?;
+    client_options.app_name = Some("mossy".to_string());
+    let client = Client::with_options(client_options)?;
+    let db = client.database("mossy");
+
+    let users = db.collection::<User>("users");
+
+    let filter = bson::doc! {
+        "apple_user_id": user_data.apple_user_id.clone(),
+    };
+
+    let user_option = match users.find_one(filter, None).await {
+        Ok(_user) => _user,
+        Err(_) => todo!()
+    };
+
+    if let Some(user) = user_option {
+        Ok(user)
+    } else {
+        todo!()
+    }
+}
+
+async fn read_tasks_action() -> Result<Vec<TaskWithLatestEvent>, Error> {
     let mut client_options = ClientOptions::parse("mongodb://localhost:27017").await?;
     client_options.app_name = Some("mossy".to_string());
     let client = Client::with_options(client_options)?;
@@ -291,7 +525,6 @@ async fn create_tag_action(tag_data: NewTagData) -> Result<InsertOneResult, Erro
 }
 
 async fn update_task_action(task_data: Task) -> Result<UpdateResult, Error> {
-    println!("task_data {:?}", task_data);
     let mut client_options = ClientOptions::parse("mongodb://localhost:27017").await?;
     client_options.app_name = Some("mossy".to_string());
     let client = Client::with_options(client_options)?;
@@ -310,7 +543,6 @@ async fn update_task_action(task_data: Task) -> Result<UpdateResult, Error> {
     let filter = bson::doc!{"_id": task_data._id };
 
     let task_result = tasks.update_one(filter, updated_task, None).await;
-    println!("task_result {:?}", task_result);
 
     match task_result {
         Ok(_task_result) => Ok(_task_result),
@@ -419,6 +651,37 @@ async fn delete_tags_action(tags_data: Vec<bson::oid::ObjectId>) -> Result<Delet
     match tags_result {
         Ok(_tags_result) => Ok(_tags_result),
         Err(_) => todo!(),
+    }
+}
+
+#[catch(500)]
+fn internal_error() -> &'static str {
+    "The server encountered an internal error."
+}
+
+#[post("/api/log-in", format="json", data="<credentials>")]
+async fn log_in(credentials: Json<Credentials>) -> Result<Json<Claims>, Status> {
+    let deserialized_credentials = credentials.into_inner();
+    let log_in_result = validate_credentials(deserialized_credentials).await;
+
+    match log_in_result {
+        Ok(_log_in_result) => Ok(Json(_log_in_result)),
+        Err(error) => {
+            // Print the specific error for dubugging until we can log it properly
+            println!("{:?}", error);
+            return Err(Status::InternalServerError)
+        },
+    }
+}
+
+#[post("/api/user", format="json", data="<user>")]
+async fn read_user(user: Json<UserData>) -> Result<Json<User>, Status> {
+    let deserialized_user = user.into_inner();
+    let user = read_user_action(deserialized_user).await;
+
+    match user {
+        Ok(user_result) => Ok(Json(user_result)),
+        Err(_) => Err(Status::InternalServerError),
     }
 }
 
@@ -564,7 +827,10 @@ async fn delete_tags(tags: Json<Vec<bson::oid::ObjectId>>) -> Result<Json<Delete
 #[launch]
 fn rocket() -> _ {
     rocket::build()
+        .register("/", catchers![internal_error])
         .mount("/", routes![index])
+        .mount("/", routes![log_in])
+        .mount("/", routes![read_user])
         .mount("/", routes![read_tasks])
         .mount("/", routes![create_task])
         .mount("/", routes![update_task])
