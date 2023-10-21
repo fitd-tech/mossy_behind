@@ -1,5 +1,6 @@
 #[macro_use] extern crate rocket;
-use mongodb::results::{InsertOneResult, DeleteResult, UpdateResult};
+use bson::Document;
+use mongodb::results::{InsertOneResult, DeleteResult, UpdateResult, InsertManyResult};
 use mongodb::{Client, options::ClientOptions};
 use mongodb::error::Error;
 use futures::stream::TryStreamExt;
@@ -7,7 +8,7 @@ use rocket::http::Status;
 use rocket::request::{Request, Outcome, FromRequest};
 use rocket::serde::{Serialize, Deserialize, json::Json};
 use mongodb::bson;
-use mongodb::options::{FindOptions, FindOneOptions};
+use mongodb::options::FindOptions;
 use reqwest;
 use reqwest::Error as ReqwestError;
 use base64::{Engine as _, engine::general_purpose};
@@ -83,6 +84,7 @@ struct User {
     email: String,
     apple_user_id: String,
     token: String,
+    is_admin: bool,
 }
 
 #[derive(Serialize, Deserialize, Debug)]
@@ -134,7 +136,7 @@ struct TaskWithLatestEvent {
     name: String,
     frequency: i32,
     tags: Option<Vec<bson::oid::ObjectId>>,
-    latest_event_date: Option<String>,
+    latest_event_date: Option<bson::DateTime>,
 }
 
 #[derive(Serialize, Deserialize, Debug)]
@@ -142,7 +144,7 @@ struct TaskWithLatestEvent {
 struct Event {
     _id: bson::oid::ObjectId,
     task: bson::oid::ObjectId,
-    date: String,
+    date: bson::DateTime,
     user: Option<bson::oid::ObjectId>,
 }
 
@@ -151,7 +153,7 @@ struct Event {
 struct EventWithStringValues {
     _id: bson::oid::ObjectId,
     task: Option<String>,
-    date: String,
+    date: bson::DateTime,
 }
 
 #[derive(Serialize, Deserialize, Debug)]
@@ -159,6 +161,31 @@ struct EventWithStringValues {
 struct NewEventData {
     task: bson::oid::ObjectId,
     date: String,
+}
+
+#[derive(Serialize, Deserialize, Debug)]
+#[serde(crate = "rocket::serde")]
+struct DebugCreateTasksData {
+    quantity: u8,
+}
+
+#[derive(Serialize, Deserialize, Debug)]
+#[serde(crate = "rocket::serde")]
+struct DebugCreateEventsData {
+    quantity: u8,
+}
+
+#[derive(Serialize, Deserialize, Debug)]
+#[serde(crate = "rocket::serde")]
+struct DebugCreateTagsData {
+    quantity: u8,
+}
+
+#[derive(Serialize, Deserialize, Debug)]
+#[serde(crate = "rocket::serde")]
+struct ReadParams {
+    limit: Option<u32>,
+    offset: Option<u32>,
 }
 
 #[derive(Debug)]
@@ -299,6 +326,7 @@ async fn validate_credentials(credentials: Credentials) -> Result<User, Credenti
             email: email_copy,
             apple_user_id: user_copy,
             token: token_create_user_copy,
+            is_admin: false,
         };
         let user_copy = user.clone();
         match users.insert_one(user_copy, None).await {
@@ -355,7 +383,10 @@ async fn read_user_action(token: Token<'_>, user_data: UserData) -> Result<User,
     }
 }
 
-async fn read_tasks_action(token: Token<'_>) -> Result<Vec<TaskWithLatestEvent>, Error> {
+async fn read_tasks_action(token: Token<'_>, params: ReadParams) -> Result<Vec<Document>, Error> {
+    let limit = params.limit.unwrap_or(0);
+    let offset = params.offset.unwrap_or(0);
+
     let mut client_options = ClientOptions::parse("mongodb://localhost:27017").await?;
     client_options.app_name = Some("mossy".to_string());
     let client = Client::with_options(client_options)?;
@@ -363,7 +394,6 @@ async fn read_tasks_action(token: Token<'_>) -> Result<Vec<TaskWithLatestEvent>,
 
     let users = db.collection::<User>("users");
     let tasks = db.collection::<Task>("tasks");
-    let events = db.collection::<Event>("events");
 
     let mut token_split = token.clone().0.split(" ");
     let Some(token_value) = token_split.nth(1) else {
@@ -377,46 +407,118 @@ async fn read_tasks_action(token: Token<'_>) -> Result<Vec<TaskWithLatestEvent>,
         todo!()
     };
 
-    let tasks_filter = bson::doc! {
-        "user": user._id,
-    };
-    let mut tasks_cursor = tasks.find(tasks_filter, None).await?;
+    let tasks_filter = vec! [
+        bson::doc! {
+            "$match": {
+                "user": user._id,
+            }
+        },
+        bson::doc! {
+            "$lookup": {
+                "from": "events",
+                "localField": "_id",
+                "foreignField": "task",
+                "as": "event_mapping", 
+            },
+        },
+        bson::doc! {
+            "$set": {
+            "event_mapping": {
+                "$sortArray": {
+                "input": "$event_mapping",
+                "sortBy": {
+                    "date": -1
+                }
+                }
+            }
+            }
+        },
+        bson::doc! {
+            "$set": {
+            "event_mapping": {
+                "$first": "$event_mapping"
+            }
+            }
+        },
+        bson::doc! {
+            "$set": {
+            "latest_event_date": "$event_mapping.date",
+            "time_since_latest_event": {
+                "$dateDiff": {
+                "startDate": "$event_mapping.date",
+                "endDate": bson::DateTime::now(),
+                "unit": "millisecond",
+                }
+            }
+            }
+        },
+        bson::doc! {
+            "$set": {
+            "frequency_in_milliseconds_raw": {
+                "$multiply": [
+                1000,
+                60,
+                60,
+                24,
+                "$frequency"
+                ]
+            }
+            }
+        },
+        bson::doc! {
+            "$set": {
+            "frequency_in_milliseconds": {
+                "$toLong": "$frequency_in_milliseconds_raw"
+            }
+            }
+        },
+        bson::doc! {
+            "$set": {
+            "moss": {
+                "$subtract": [
+                "$time_since_latest_event",
+                "$frequency_in_milliseconds"
+                ]
+            }
+            }
+        },
+        bson::doc! {
+            "$unset": [
+                "event_mapping",
+                "frequency_in_milliseconds_raw",
+                "frequency_in_milliseconds",
+            ]
+        },
+        bson::doc! {
+            // We also need to sort by a unique value (_id) to ensure we don't get duplicates in pagination
+            // We should eventually create a compound index for this: https://www.mongodb.com/docs/manual/tutorial/sort-results-with-indexes/#sort-on-multiple-fields
+            "$sort": {
+                "moss": -1,
+                "_id": -1,
+            }
+        },
+        bson::doc! {
+            "$skip": offset
+        },
+        bson::doc! {
+            "$limit": limit
+        },
+    ];
+    let mut tasks_cursor = tasks.aggregate(tasks_filter, None).await?;
 
     let mut tasks_list = Vec::new();
 
     while let Some(task) = tasks_cursor.try_next().await? {
-        let filter = bson::doc! {
-            "task": task._id,
-        };
-        let sort_option = bson::doc! {
-            "date": -1,
-        };
-        let options = FindOneOptions::builder().sort(sort_option).build();
-        let latest_event = events.find_one(filter, options).await?;
-
-        let task_with_latest_event = match latest_event {
-            Some(_latest_event) => TaskWithLatestEvent {
-                _id: task._id,
-                name: task.name,
-                frequency: task.frequency,
-                tags: task.tags,
-                latest_event_date: Some(_latest_event.date),
-            },
-            None => TaskWithLatestEvent {
-                _id: task._id,
-                name: task.name,
-                frequency: task.frequency,
-                tags: task.tags,
-                latest_event_date: None,
-            }
-        };
-        tasks_list.push(task_with_latest_event);
+        tasks_list.push(task);
     }
 
     Ok(tasks_list)
 }
 
-async fn read_events_action(token: Token<'_>) ->Result<Vec<Event>, Error> {
+async fn read_events_action(token: Token<'_>, params: ReadParams) ->Result<Vec<Event>, Error> {
+    let limit = params.limit.unwrap_or(0);
+    let offset = params.offset.unwrap_or(0);
+
     let mut client_options = ClientOptions::parse("mongodb://localhost:27017").await?;
     client_options.app_name = Some("mossy".to_string());
     let client = Client::with_options(client_options)?;
@@ -442,8 +544,9 @@ async fn read_events_action(token: Token<'_>) ->Result<Vec<Event>, Error> {
     };
     let sort_option = bson::doc! {
         "date": -1,
+        "_id": -1,
     };
-    let options = FindOptions::builder().sort(sort_option).build();
+    let options = FindOptions::builder().sort(sort_option).skip(Some(u64::from(offset))).limit(Some(i64::from(limit))).build();
     let mut cursor = events.find(events_filter, options).await?;
 
     let mut events_list = Vec::new();
@@ -455,7 +558,10 @@ async fn read_events_action(token: Token<'_>) ->Result<Vec<Event>, Error> {
     Ok(events_list)
 }
 
-async fn read_events_string_action(token: Token<'_>) ->Result<Vec<EventWithStringValues>, Error> {
+async fn read_events_string_action(token: Token<'_>, params: ReadParams) ->Result<Vec<EventWithStringValues>, Error> {
+    let limit = params.limit.unwrap_or(0);
+    let offset = params.offset.unwrap_or(0);
+
     let mut client_options = ClientOptions::parse("mongodb://localhost:27017").await?;
     client_options.app_name = Some("mossy".to_string());
     let client = Client::with_options(client_options)?;
@@ -482,8 +588,9 @@ async fn read_events_string_action(token: Token<'_>) ->Result<Vec<EventWithStrin
     };
     let sort_option = bson::doc! {
         "date": -1,
+        "_id": -1,
     };
-    let options = FindOptions::builder().sort(sort_option).build();
+    let options = FindOptions::builder().sort(sort_option).skip(Some(u64::from(offset))).limit(Some(i64::from(limit))).build();
     let mut cursor = events.find(events_filter, options).await?;
 
     let mut events_list = Vec::new();
@@ -512,7 +619,10 @@ async fn read_events_string_action(token: Token<'_>) ->Result<Vec<EventWithStrin
     Ok(events_list)
 }
 
-async fn read_tags_action(token: Token<'_>) ->Result<Vec<Tag>, Error> {
+async fn read_tags_action(token: Token<'_>, params: ReadParams) ->Result<Vec<Tag>, Error> {
+    let limit = params.limit.unwrap_or(0);
+    let offset = params.offset.unwrap_or(0);
+
     let mut client_options = ClientOptions::parse("mongodb://localhost:27017").await?;
     client_options.app_name = Some("mossy".to_string());
     let client = Client::with_options(client_options)?;
@@ -538,8 +648,9 @@ async fn read_tags_action(token: Token<'_>) ->Result<Vec<Tag>, Error> {
     };
     let sort_option = bson::doc! {
         "name": 1,
+        "_id": -1,
     };
-    let options = FindOptions::builder().sort(sort_option).build();
+    let options = FindOptions::builder().sort(sort_option).skip(Some(u64::from(offset))).limit(Some(i64::from(limit))).build();
     let mut cursor = tags.find(tags_filter, options).await?;
 
     let mut tags_list = Vec::new();
@@ -609,10 +720,14 @@ async fn create_event_action(token: Token<'_>, event_data: NewEventData) -> Resu
         todo!()
     };
 
+    let date = match bson::DateTime::parse_rfc3339_str(event_data.date) {
+        Ok(_date) => _date,
+        Err(_date) => todo!()
+    };
     let new_event = Event {
         _id: bson::oid::ObjectId::new(),
         task: event_data.task,
-        date: event_data.date,
+        date: date,
         user: Some(user._id),
     };
 
@@ -944,6 +1059,261 @@ async fn delete_tags_action(token: Token<'_>, tags_data: Vec<bson::oid::ObjectId
     }
 }
 
+async fn debug_create_tasks_action(token: Token<'_>, data: DebugCreateTasksData) -> Result<InsertManyResult, Error> {
+    let mut client_options = ClientOptions::parse("mongodb://localhost:27017").await?;
+    client_options.app_name = Some("mossy".to_string());
+    let client = Client::with_options(client_options)?;
+    let db = client.database("mossy");
+
+    let users = db.collection::<User>("users");
+    let tasks = db.collection::<Task>("tasks");
+
+    let mut token_split = token.clone().0.split(" ");
+    let Some(token_value) = token_split.nth(1) else {
+        todo!()
+    };
+
+    let user_filter = bson::doc! {
+        "token": token_value,
+    };
+    let Some(user) = users.find_one(user_filter, None).await? else {
+        todo!()
+    };
+    if user.is_admin == false {
+        todo!()
+    };
+
+    let quantity_to_create = data.quantity;
+
+    let mut iteration = 0;
+    let mut new_tasks = Vec::new();
+
+    while iteration < quantity_to_create {
+        let new_task = Task {
+            _id: bson::oid::ObjectId::new(),
+            name: String::from(iteration.to_string()),
+            frequency: 7,
+            tags: None,
+            user: Some(user._id),
+        };
+        new_tasks.push(new_task);
+        iteration += 1;
+    }
+
+
+    let task_result = tasks.insert_many(new_tasks, None).await;
+
+    match task_result {
+        Ok(_task_result) => Ok(_task_result),
+        Err(_) => todo!(),
+    }
+}
+
+async fn debug_delete_tasks_action(token: Token<'_>) -> Result<DeleteResult, Error> {
+    let mut client_options = ClientOptions::parse("mongodb://localhost:27017").await?;
+    client_options.app_name = Some("mossy".to_string());
+    let client = Client::with_options(client_options)?;
+    let db = client.database("mossy");
+
+    let users = db.collection::<User>("users");
+    let tasks = db.collection::<Task>("tasks");
+
+    let mut token_split = token.clone().0.split(" ");
+    let Some(token_value) = token_split.nth(1) else {
+        todo!()
+    };
+
+    let user_filter = bson::doc! {
+        "token": token_value,
+    };
+    let Some(user) = users.find_one(user_filter, None).await? else {
+        todo!()
+    };
+    if user.is_admin == false {
+        todo!()
+    };
+
+    let filter = bson::doc!{"user": user._id};
+
+    let tasks_result = tasks.delete_many(filter, None).await;
+
+    match tasks_result {
+        Ok(_tasks_result) => Ok(_tasks_result),
+        Err(_) => todo!(),
+    }
+}
+
+async fn debug_create_events_action(token: Token<'_>) -> Result<InsertManyResult, Error> {
+    let mut client_options = ClientOptions::parse("mongodb://localhost:27017").await?;
+    client_options.app_name = Some("mossy".to_string());
+    let client = Client::with_options(client_options)?;
+    let db = client.database("mossy");
+
+    let users = db.collection::<User>("users");
+    let tasks = db.collection::<Task>("tasks");
+    let events = db.collection::<Event>("events");
+
+    let mut token_split = token.clone().0.split(" ");
+    let Some(token_value) = token_split.nth(1) else {
+        todo!()
+    };
+
+    let user_filter = bson::doc! {
+        "token": token_value,
+    };
+    let Some(user) = users.find_one(user_filter, None).await? else {
+        todo!()
+    };
+    if user.is_admin == false {
+        todo!()
+    };
+
+    let mut new_events = Vec::new();
+
+    let tasks_filter = bson::doc! {
+        "user": user._id,
+    };
+    let mut tasks_cursor = tasks.find(tasks_filter, None).await?;
+    while let Some(task) = tasks_cursor.try_next().await? {
+        let date = match bson::DateTime::parse_rfc3339_str("2023-10-01T05:43:48.487Z") {
+            Ok(_date) => _date,
+            Err(_date) => todo!(),
+        };
+        let new_event = Event {
+            _id: bson::oid::ObjectId::new(),
+            task: task._id,
+            date: date,
+            user: Some(user._id),
+        };
+        new_events.push(new_event);
+    }
+
+    let events_result = events.insert_many(new_events, None).await;
+
+    match events_result {
+        Ok(_events_result) => Ok(_events_result),
+        Err(_) => todo!(),
+    }
+}
+
+async fn debug_delete_events_action(token: Token<'_>) -> Result<DeleteResult, Error> {
+    let mut client_options = ClientOptions::parse("mongodb://localhost:27017").await?;
+    client_options.app_name = Some("mossy".to_string());
+    let client = Client::with_options(client_options)?;
+    let db = client.database("mossy");
+
+    let users = db.collection::<User>("users");
+    let events = db.collection::<Event>("events");
+
+    let mut token_split = token.clone().0.split(" ");
+    let Some(token_value) = token_split.nth(1) else {
+        todo!()
+    };
+
+    let user_filter = bson::doc! {
+        "token": token_value,
+    };
+    let Some(user) = users.find_one(user_filter, None).await? else {
+        todo!()
+    };
+    if user.is_admin == false {
+        todo!()
+    };
+
+    let filter = bson::doc!{"user": user._id};
+
+    let events_result = events.delete_many(filter, None).await;
+
+    match events_result {
+        Ok(_events_result) => Ok(_events_result),
+        Err(_) => todo!(),
+    }
+}
+
+async fn debug_create_tags_action(token: Token<'_>, data: DebugCreateTagsData) -> Result<InsertManyResult, Error> {
+    let mut client_options = ClientOptions::parse("mongodb://localhost:27017").await?;
+    client_options.app_name = Some("mossy".to_string());
+    let client = Client::with_options(client_options)?;
+    let db = client.database("mossy");
+
+    let users = db.collection::<User>("users");
+    let tags = db.collection::<Tag>("tags");
+
+    let mut token_split = token.clone().0.split(" ");
+    let Some(token_value) = token_split.nth(1) else {
+        todo!()
+    };
+
+    let user_filter = bson::doc! {
+        "token": token_value,
+    };
+    let Some(user) = users.find_one(user_filter, None).await? else {
+        todo!()
+    };
+    if user.is_admin == false {
+        todo!()
+    };
+
+    let quantity_to_create = data.quantity;
+
+    let mut iteration = 0;
+    let mut new_tags = Vec::new();
+
+    while iteration < quantity_to_create {
+        let new_tag = Tag {
+            _id: bson::oid::ObjectId::new(),
+            name: String::from(iteration.to_string()),
+            description: None,
+            parent_tag: None,
+            user: Some(user._id),
+        };
+        new_tags.push(new_tag);
+        iteration += 1;
+    }
+
+
+    let tags_result = tags.insert_many(new_tags, None).await;
+
+    match tags_result {
+        Ok(_tags_result) => Ok(_tags_result),
+        Err(_) => todo!(),
+    }
+}
+
+async fn debug_delete_tags_action(token: Token<'_>) -> Result<DeleteResult, Error> {
+    let mut client_options = ClientOptions::parse("mongodb://localhost:27017").await?;
+    client_options.app_name = Some("mossy".to_string());
+    let client = Client::with_options(client_options)?;
+    let db = client.database("mossy");
+
+    let users = db.collection::<User>("users");
+    let tags = db.collection::<Task>("tags");
+
+    let mut token_split = token.clone().0.split(" ");
+    let Some(token_value) = token_split.nth(1) else {
+        todo!()
+    };
+
+    let user_filter = bson::doc! {
+        "token": token_value,
+    };
+    let Some(user) = users.find_one(user_filter, None).await? else {
+        todo!()
+    };
+    if user.is_admin == false {
+        todo!()
+    };
+
+    let filter = bson::doc!{"user": user._id};
+
+    let tags_result = tags.delete_many(filter, None).await;
+
+    match tags_result {
+        Ok(_tags_result) => Ok(_tags_result),
+        Err(_) => todo!(),
+    }
+}
+
 #[derive(Debug, Clone)]
 struct Token<'r>(&'r str);
 
@@ -988,7 +1358,7 @@ async fn log_in(credentials: Json<Credentials>) -> Result<Json<User>, Status> {
 #[post("/api/user", format="json", data="<user>")]
 async fn read_user(token: Token<'_>, user: Json<UserData>) -> Result<Json<User>, Status> {
     let deserialized_user = user.into_inner();
-    let user = read_user_action(deserialized_user).await;
+    let user = read_user_action(token, deserialized_user).await;
 
     match user {
         Ok(user_result) => Ok(Json(user_result)),
@@ -996,9 +1366,13 @@ async fn read_user(token: Token<'_>, user: Json<UserData>) -> Result<Json<User>,
     }
 }
 
-#[get("/api/tasks", format="json")]
-async fn read_tasks(token: Token<'_>) -> Result<Json<Vec<TaskWithLatestEvent>>, Status> {
-    let tasks = read_tasks_action(token).await;
+#[get("/api/tasks?<limit>&<offset>", format="json")]
+async fn read_tasks(token: Token<'_>, limit: Option<u32>, offset: Option<u32>) -> Result<Json<Vec<Document>>, Status> {
+    let params = ReadParams {
+        limit: limit,
+        offset: offset,
+    };
+    let tasks = read_tasks_action(token, params).await;
 
     match tasks {
         Ok(tasks_result) => Ok(Json(tasks_result)),
@@ -1039,9 +1413,13 @@ async fn delete_tasks(token: Token<'_>, tasks: Json<Vec<bson::oid::ObjectId>>) -
     }
 }
 
-#[get("/api/events", format="json")]
-async fn read_events(token: Token<'_>) -> Result<Json<Vec<Event>>, Status> {
-    let events = read_events_action(token).await;
+#[get("/api/events?<limit>&<offset>", format="json")]
+async fn read_events(token: Token<'_>, limit: Option<u32>, offset: Option<u32>) -> Result<Json<Vec<Event>>, Status> {
+    let params = ReadParams {
+        limit: limit,
+        offset: offset,
+    };
+    let events = read_events_action(token, params).await;
 
     match events {
         Ok(events_result) => Ok(Json(events_result)),
@@ -1049,9 +1427,13 @@ async fn read_events(token: Token<'_>) -> Result<Json<Vec<Event>>, Status> {
     }
 }
 
-#[get("/api/events-string", format="json")]
-async fn read_events_string(token: Token<'_>) -> Result<Json<Vec<EventWithStringValues>>, Status> {
-    let events = read_events_string_action(token).await;
+#[get("/api/events-string?<limit>&<offset>", format="json")]
+async fn read_events_string(token: Token<'_>, limit: Option<u32>, offset: Option<u32>) -> Result<Json<Vec<EventWithStringValues>>, Status> {
+    let params = ReadParams {
+        limit: limit,
+        offset: offset,
+    };
+    let events = read_events_string_action(token, params).await;
 
     match events {
         Ok(events_result) => Ok(Json(events_result)),
@@ -1092,9 +1474,13 @@ async fn delete_events(token: Token<'_>, events: Json<Vec<bson::oid::ObjectId>>)
     }
 }
 
-#[get("/api/tags", format="json")]
-async fn read_tags(token: Token<'_>) -> Result<Json<Vec<Tag>>, Status> {
-    let tags = read_tags_action(token).await;
+#[get("/api/tags?<limit>&<offset>", format="json")]
+async fn read_tags(token: Token<'_>, limit: Option<u32>, offset: Option<u32>) -> Result<Json<Vec<Tag>>, Status> {
+    let params = ReadParams {
+        limit: limit,
+        offset: offset,
+    };
+    let tags = read_tags_action(token, params).await;
 
     match tags {
         Ok(tags_result) => Ok(Json(tags_result)),
@@ -1135,6 +1521,68 @@ async fn delete_tags(token: Token<'_>, tags: Json<Vec<bson::oid::ObjectId>>) -> 
     }
 }
 
+#[post("/api/debug/tasks", format="json", data="<data>")]
+async fn debug_create_tasks(token: Token<'_>, data: Json<DebugCreateTasksData>) -> Result<Json<InsertManyResult>, Status> {
+    let deserialized_data = data.into_inner();
+    let tasks = debug_create_tasks_action(token, deserialized_data).await;
+
+    match tasks {
+        Ok(tasks_result) => Ok(Json(tasks_result)),
+        Err(_) => Err(Status::InternalServerError),
+    }
+}
+
+#[delete("/api/debug/tasks", format="json")]
+async fn debug_delete_tasks(token: Token<'_>) -> Result<Json<DeleteResult>, Status> {
+    let delete_result = debug_delete_tasks_action(token).await;
+
+    match delete_result {
+        Ok(_delete_result) => Ok(Json(_delete_result)),
+        Err(_) => Err(Status::InternalServerError),
+    }
+}
+
+#[post("/api/debug/events", format="json")]
+async fn debug_create_events(token: Token<'_>) -> Result<Json<InsertManyResult>, Status> {
+    let events = debug_create_events_action(token).await;
+
+    match events {
+        Ok(events_result) => Ok(Json(events_result)),
+        Err(_) => Err(Status::InternalServerError),
+    }
+}
+
+#[delete("/api/debug/events", format="json")]
+async fn debug_delete_events(token: Token<'_>) -> Result<Json<DeleteResult>, Status> {
+    let delete_result = debug_delete_events_action(token).await;
+
+    match delete_result {
+        Ok(_delete_result) => Ok(Json(_delete_result)),
+        Err(_) => Err(Status::InternalServerError),
+    }
+}
+
+#[post("/api/debug/tags", format="json", data="<data>")]
+async fn debug_create_tags(token: Token<'_>, data: Json<DebugCreateTagsData>) -> Result<Json<InsertManyResult>, Status> {
+    let deserialized_data = data.into_inner();
+    let tags = debug_create_tags_action(token, deserialized_data).await;
+
+    match tags {
+        Ok(tags_result) => Ok(Json(tags_result)),
+        Err(_) => Err(Status::InternalServerError),
+    }
+}
+
+#[delete("/api/debug/tags", format="json")]
+async fn debug_delete_tags(token: Token<'_>) -> Result<Json<DeleteResult>, Status> {
+    let delete_result = debug_delete_tags_action(token).await;
+
+    match delete_result {
+        Ok(_delete_result) => Ok(Json(_delete_result)),
+        Err(_) => Err(Status::InternalServerError),
+    }
+}
+
 #[launch]
 fn rocket() -> _ {
     rocket::build()
@@ -1155,4 +1603,10 @@ fn rocket() -> _ {
         .mount("/", routes![create_tag])
         .mount("/", routes![update_tag])
         .mount("/", routes![delete_tags])
+        .mount("/", routes![debug_create_tasks])
+        .mount("/", routes![debug_delete_tasks])
+        .mount("/", routes![debug_create_events])
+        .mount("/", routes![debug_delete_events])
+        .mount("/", routes![debug_create_tags])
+        .mount("/", routes![debug_delete_tags])
 }
