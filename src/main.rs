@@ -4,6 +4,7 @@ use mongodb::{Client, options::ClientOptions};
 use mongodb::error::Error;
 use futures::stream::TryStreamExt;
 use rocket::http::Status;
+use rocket::request::{Request, Outcome, FromRequest};
 use rocket::serde::{Serialize, Deserialize, json::Json};
 use mongodb::bson;
 use mongodb::options::{FindOptions, FindOneOptions};
@@ -75,12 +76,13 @@ struct Claims {
     nonce: Option<String>,
 }
 
-#[derive(Serialize, Deserialize, Debug)]
+#[derive(Serialize, Deserialize, Debug, Clone)]
 #[serde(crate = "rocket::serde")]
 struct User {
     _id: bson::oid::ObjectId,
     email: String,
     apple_user_id: String,
+    token: String,
 }
 
 #[derive(Serialize, Deserialize, Debug)]
@@ -96,6 +98,7 @@ struct Tag {
     name: String,
     description: Option<String>,
     parent_tag: Option<bson::oid::ObjectId>,
+    user: Option<bson::oid::ObjectId>,
 }
 
 #[derive(Serialize, Deserialize, Debug)]
@@ -120,7 +123,8 @@ struct Task {
     _id: bson::oid::ObjectId,
     name: String,
     frequency: i32,
-    tags: Option<Vec<bson::oid::ObjectId>>
+    tags: Option<Vec<bson::oid::ObjectId>>,
+    user: Option<bson::oid::ObjectId>,
 }
 
 #[derive(Serialize, Deserialize, Debug)]
@@ -139,6 +143,7 @@ struct Event {
     _id: bson::oid::ObjectId,
     task: bson::oid::ObjectId,
     date: String,
+    user: Option<bson::oid::ObjectId>,
 }
 
 #[derive(Serialize, Deserialize, Debug)]
@@ -182,7 +187,7 @@ async fn index() -> &'static str {
 // https://stackoverflow.com/questions/66067321/marshal-appleids-public-key-to-rsa-publickey
 // https://developer.apple.com/documentation/sign_in_with_apple/sign_in_with_apple_rest_api/verifying_a_user
 // https://jwt.io/ to decode JWT
-async fn validate_credentials(credentials: Credentials) -> Result<Claims, CredentialsError> {
+async fn validate_credentials(credentials: Credentials) -> Result<User, CredentialsError> {
     let keys_response = match reqwest::get("https://appleid.apple.com/auth/keys").await {
         Ok(_keys_response) => _keys_response,
         Err(_keys_response) => return Err(CredentialsError::FetchKeysError(_keys_response))
@@ -283,21 +288,41 @@ async fn validate_credentials(credentials: Credentials) -> Result<Claims, Creden
         Ok(_existing_user) => _existing_user,
         Err(_existing_user) => return Err(CredentialsError::DatabaseError)
     };
-    if existing_user_option.is_none() {
+    let token = bson::uuid::Uuid::new().to_string();
+    let token_create_user_copy = token.clone();
+    let token_update_user_copy = token.clone();
+    let saved_user = if existing_user_option.is_none() {
         let email_copy = claims.claims.email.clone();
         let user_copy = credentials.user.clone();
-        let new_user = User {
+        let user = User {
             _id: bson::oid::ObjectId::new(),
             email: email_copy,
             apple_user_id: user_copy,
+            token: token_create_user_copy,
         };
-        match users.insert_one(new_user, None).await {
+        let user_copy = user.clone();
+        match users.insert_one(user_copy, None).await {
             Ok(_user_result) => _user_result,
             Err(_) => return Err(CredentialsError::DatabaseError)
         };
-    }
-    
-    Ok(claims.claims)
+        user
+    } else {
+        let updated_user = bson::doc! {
+            "$set": {
+                "token": token,
+            }
+        };
+        let mut existing_user = existing_user_option.unwrap();
+        let filter = bson::doc!{"_id": existing_user._id };
+        match users.update_one(filter, updated_user, None).await {
+            Ok(_user_result) => _user_result,
+            Err(_) => return Err(CredentialsError::DatabaseError)
+        };
+        existing_user.token = token_update_user_copy;
+        existing_user
+    };
+
+    Ok(saved_user)
 }
 
 async fn read_user_action(user_data: UserData) -> Result<User, Error> {
@@ -324,20 +349,36 @@ async fn read_user_action(user_data: UserData) -> Result<User, Error> {
     }
 }
 
-async fn read_tasks_action() -> Result<Vec<TaskWithLatestEvent>, Error> {
+async fn read_tasks_action(token: Token<'_>) -> Result<Vec<TaskWithLatestEvent>, Error> {
     let mut client_options = ClientOptions::parse("mongodb://localhost:27017").await?;
     client_options.app_name = Some("mossy".to_string());
     let client = Client::with_options(client_options)?;
     let db = client.database("mossy");
 
+    let users = db.collection::<User>("users");
     let tasks = db.collection::<Task>("tasks");
     let events = db.collection::<Event>("events");
 
-    let mut cursor = tasks.find(None, None).await?;
+    let mut token_split = token.clone().0.split(" ");
+    let Some(token_value) = token_split.nth(1) else {
+        todo!()
+    };
+
+    let user_filter = bson::doc! {
+        "token": token_value,
+    };
+    let Some(user) = users.find_one(user_filter, None).await? else {
+        todo!()
+    };
+
+    let tasks_filter = bson::doc! {
+        "user": user._id,
+    };
+    let mut tasks_cursor = tasks.find(tasks_filter, None).await?;
 
     let mut tasks_list = Vec::new();
 
-    while let Some(task) = cursor.try_next().await? {
+    while let Some(task) = tasks_cursor.try_next().await? {
         let filter = bson::doc! {
             "task": task._id,
         };
@@ -369,19 +410,35 @@ async fn read_tasks_action() -> Result<Vec<TaskWithLatestEvent>, Error> {
     Ok(tasks_list)
 }
 
-async fn read_events_action() ->Result<Vec<Event>, Error> {
+async fn read_events_action(token: Token<'_>) ->Result<Vec<Event>, Error> {
     let mut client_options = ClientOptions::parse("mongodb://localhost:27017").await?;
     client_options.app_name = Some("mossy".to_string());
     let client = Client::with_options(client_options)?;
     let db = client.database("mossy");
 
+    let users = db.collection::<User>("users");
     let events = db.collection::<Event>("events");
 
+    let mut token_split = token.clone().0.split(" ");
+    let Some(token_value) = token_split.nth(1) else {
+        todo!()
+    };
+
+    let user_filter = bson::doc! {
+        "token": token_value,
+    };
+    let Some(user) = users.find_one(user_filter, None).await? else {
+        todo!()
+    };
+
+    let events_filter = bson::doc! {
+        "user": user._id,
+    };
     let sort_option = bson::doc! {
         "date": -1,
     };
     let options = FindOptions::builder().sort(sort_option).build();
-    let mut cursor = events.find(None, options).await?;
+    let mut cursor = events.find(events_filter, options).await?;
 
     let mut events_list = Vec::new();
 
@@ -392,20 +449,36 @@ async fn read_events_action() ->Result<Vec<Event>, Error> {
     Ok(events_list)
 }
 
-async fn read_events_string_action() ->Result<Vec<EventWithStringValues>, Error> {
+async fn read_events_string_action(token: Token<'_>) ->Result<Vec<EventWithStringValues>, Error> {
     let mut client_options = ClientOptions::parse("mongodb://localhost:27017").await?;
     client_options.app_name = Some("mossy".to_string());
     let client = Client::with_options(client_options)?;
     let db = client.database("mossy");
 
+    let users = db.collection::<User>("users");
     let events = db.collection::<Event>("events");
     let tasks = db.collection::<Task>("tasks");
 
+    let mut token_split = token.clone().0.split(" ");
+    let Some(token_value) = token_split.nth(1) else {
+        todo!()
+    };
+
+    let user_filter = bson::doc! {
+        "token": token_value,
+    };
+    let Some(user) = users.find_one(user_filter, None).await? else {
+        todo!()
+    };
+
+    let events_filter = bson::doc! {
+        "user": user._id,
+    };
     let sort_option = bson::doc! {
         "date": -1,
     };
     let options = FindOptions::builder().sort(sort_option).build();
-    let mut cursor = events.find(None, options).await?;
+    let mut cursor = events.find(events_filter, options).await?;
 
     let mut events_list = Vec::new();
 
@@ -433,19 +506,35 @@ async fn read_events_string_action() ->Result<Vec<EventWithStringValues>, Error>
     Ok(events_list)
 }
 
-async fn read_tags_action() ->Result<Vec<Tag>, Error> {
+async fn read_tags_action(token: Token<'_>) ->Result<Vec<Tag>, Error> {
     let mut client_options = ClientOptions::parse("mongodb://localhost:27017").await?;
     client_options.app_name = Some("mossy".to_string());
     let client = Client::with_options(client_options)?;
     let db = client.database("mossy");
 
+    let users = db.collection::<User>("users");
     let tags = db.collection::<Tag>("tags");
 
+    let mut token_split = token.clone().0.split(" ");
+    let Some(token_value) = token_split.nth(1) else {
+        todo!()
+    };
+
+    let user_filter = bson::doc! {
+        "token": token_value,
+    };
+    let Some(user) = users.find_one(user_filter, None).await? else {
+        todo!()
+    };
+
+    let tags_filter = bson::doc! {
+        "user": user._id,
+    };
     let sort_option = bson::doc! {
         "name": 1,
     };
     let options = FindOptions::builder().sort(sort_option).build();
-    let mut cursor = tags.find(None, options).await?;
+    let mut cursor = tags.find(tags_filter, options).await?;
 
     let mut tags_list = Vec::new();
 
@@ -456,19 +545,33 @@ async fn read_tags_action() ->Result<Vec<Tag>, Error> {
     Ok(tags_list)
 }
 
-async fn create_task_action(task_data: NewTaskData) -> Result<InsertOneResult, Error> {
+async fn create_task_action(token: Token<'_>, task_data: NewTaskData) -> Result<InsertOneResult, Error> {
     let mut client_options = ClientOptions::parse("mongodb://localhost:27017").await?;
     client_options.app_name = Some("mossy".to_string());
     let client = Client::with_options(client_options)?;
     let db = client.database("mossy");
 
+    let users = db.collection::<User>("users");
     let tasks = db.collection::<Task>("tasks");
+
+    let mut token_split = token.clone().0.split(" ");
+    let Some(token_value) = token_split.nth(1) else {
+        todo!()
+    };
+
+    let user_filter = bson::doc! {
+        "token": token_value,
+    };
+    let Some(user) = users.find_one(user_filter, None).await? else {
+        todo!()
+    };
 
     let new_task = Task {
         _id: bson::oid::ObjectId::new(),
         name: task_data.name,
         frequency: task_data.frequency,
         tags: task_data.tags,
+        user: Some(user._id),
     };
 
     let task_result = tasks.insert_one(new_task, None).await;
@@ -479,18 +582,32 @@ async fn create_task_action(task_data: NewTaskData) -> Result<InsertOneResult, E
     }
 }
 
-async fn create_event_action(event_data: NewEventData) -> Result<InsertOneResult, Error> {
+async fn create_event_action(token: Token<'_>, event_data: NewEventData) -> Result<InsertOneResult, Error> {
     let mut client_options = ClientOptions::parse("mongodb://localhost:27017").await?;
     client_options.app_name = Some("mossy".to_string());
     let client = Client::with_options(client_options)?;
     let db = client.database("mossy");
 
+    let users = db.collection::<User>("users");
     let events = db.collection::<Event>("events");
+
+    let mut token_split = token.clone().0.split(" ");
+    let Some(token_value) = token_split.nth(1) else {
+        todo!()
+    };
+
+    let user_filter = bson::doc! {
+        "token": token_value,
+    };
+    let Some(user) = users.find_one(user_filter, None).await? else {
+        todo!()
+    };
 
     let new_event = Event {
         _id: bson::oid::ObjectId::new(),
         task: event_data.task,
         date: event_data.date,
+        user: Some(user._id),
     };
 
     let event_result = events.insert_one(new_event, None).await;
@@ -501,19 +618,33 @@ async fn create_event_action(event_data: NewEventData) -> Result<InsertOneResult
     }
 }
 
-async fn create_tag_action(tag_data: NewTagData) -> Result<InsertOneResult, Error> {
+async fn create_tag_action(token: Token<'_>, tag_data: NewTagData) -> Result<InsertOneResult, Error> {
     let mut client_options = ClientOptions::parse("mongodb://localhost:27017").await?;
     client_options.app_name = Some("mossy".to_string());
     let client = Client::with_options(client_options)?;
     let db = client.database("mossy");
 
+    let users = db.collection::<User>("users");
     let tags = db.collection::<Tag>("tags");
+
+    let mut token_split = token.clone().0.split(" ");
+    let Some(token_value) = token_split.nth(1) else {
+        todo!()
+    };
+
+    let user_filter = bson::doc! {
+        "token": token_value,
+    };
+    let Some(user) = users.find_one(user_filter, None).await? else {
+        todo!()
+    };
 
     let new_tag = Tag {
         _id: bson::oid::ObjectId::new(),
         name: tag_data.name,
         description: tag_data.description,
         parent_tag: tag_data.parent_tag,
+        user: Some(user._id),
     };
 
     let tag_result = tags.insert_one(new_tag, None).await;
@@ -524,13 +655,37 @@ async fn create_tag_action(tag_data: NewTagData) -> Result<InsertOneResult, Erro
     }
 }
 
-async fn update_task_action(task_data: Task) -> Result<UpdateResult, Error> {
+async fn update_task_action(token: Token<'_>, task_data: Task) -> Result<UpdateResult, Error> {
     let mut client_options = ClientOptions::parse("mongodb://localhost:27017").await?;
     client_options.app_name = Some("mossy".to_string());
     let client = Client::with_options(client_options)?;
     let db = client.database("mossy");
 
+    let users = db.collection::<User>("users");
     let tasks = db.collection::<Task>("tasks");
+
+    let mut token_split = token.clone().0.split(" ");
+    let Some(token_value) = token_split.nth(1) else {
+        todo!()
+    };
+
+    let user_filter = bson::doc! {
+        "token": token_value,
+    };
+    let Some(user) = users.find_one(user_filter, None).await? else {
+        todo!()
+    };
+
+    // Make sure the task to update belongs to the user
+    let task_filter = bson::doc! {
+        "_id": task_data._id,
+    };
+    let Some(task) = tasks.find_one(task_filter, None).await? else {
+        todo!()
+    };
+    if task.user != Some(user._id) {
+        todo!()
+    };
 
     let updated_task = bson::doc! {
         "$set": {
@@ -550,13 +705,37 @@ async fn update_task_action(task_data: Task) -> Result<UpdateResult, Error> {
     }
 }
 
-async fn update_event_action(event_data: EventWithStringValues) -> Result<UpdateResult, Error> {
+async fn update_event_action(token: Token<'_>, event_data: EventWithStringValues) -> Result<UpdateResult, Error> {
     let mut client_options = ClientOptions::parse("mongodb://localhost:27017").await?;
     client_options.app_name = Some("mossy".to_string());
     let client = Client::with_options(client_options)?;
     let db = client.database("mossy");
 
+    let users = db.collection::<User>("users");
     let events = db.collection::<Event>("events");
+
+    let mut token_split = token.clone().0.split(" ");
+    let Some(token_value) = token_split.nth(1) else {
+        todo!()
+    };
+
+    let user_filter = bson::doc! {
+        "token": token_value,
+    };
+    let Some(user) = users.find_one(user_filter, None).await? else {
+        todo!()
+    };
+
+    // Make sure the event to update belongs to the user
+    let event_filter = bson::doc! {
+        "_id": event_data._id,
+    };
+    let Some(event) = events.find_one(event_filter, None).await? else {
+        todo!()
+    };
+    if event.user != Some(user._id) {
+        todo!()
+    };
 
     let updated_event = bson::doc! {
         "$set": {
@@ -574,13 +753,37 @@ async fn update_event_action(event_data: EventWithStringValues) -> Result<Update
     }
 }
 
-async fn update_tag_action(tag_data: Tag) -> Result<UpdateResult, Error> {
+async fn update_tag_action(token: Token<'_>, tag_data: Tag) -> Result<UpdateResult, Error> {
     let mut client_options = ClientOptions::parse("mongodb://localhost:27017").await?;
     client_options.app_name = Some("mossy".to_string());
     let client = Client::with_options(client_options)?;
     let db = client.database("mossy");
 
+    let users = db.collection::<User>("users");
     let tags = db.collection::<Tag>("tags");
+
+    let mut token_split = token.clone().0.split(" ");
+    let Some(token_value) = token_split.nth(1) else {
+        todo!()
+    };
+
+    let user_filter = bson::doc! {
+        "token": token_value,
+    };
+    let Some(user) = users.find_one(user_filter, None).await? else {
+        todo!()
+    };
+
+    // Make sure the tag to update belongs to the user
+    let tag_filter = bson::doc! {
+        "_id": tag_data._id,
+    };
+    let Some(tag) = tags.find_one(tag_filter, None).await? else {
+        todo!()
+    };
+    if tag.user != Some(user._id) {
+        todo!()
+    };
 
     let updated_tag = bson::doc! {
         "$set": {
@@ -600,13 +803,40 @@ async fn update_tag_action(tag_data: Tag) -> Result<UpdateResult, Error> {
     }
 }
 
-async fn delete_tasks_action(tasks_data: Vec<bson::oid::ObjectId>) -> Result<DeleteResult, Error> {
+async fn delete_tasks_action(token: Token<'_>, tasks_data: Vec<bson::oid::ObjectId>) -> Result<DeleteResult, Error> {
     let mut client_options = ClientOptions::parse("mongodb://localhost:27017").await?;
     client_options.app_name = Some("mossy".to_string());
     let client = Client::with_options(client_options)?;
     let db = client.database("mossy");
 
+    let users = db.collection::<User>("users");
     let tasks = db.collection::<Task>("tasks");
+
+    let mut token_split = token.clone().0.split(" ");
+    let Some(token_value) = token_split.nth(1) else {
+        todo!()
+    };
+
+    let user_filter = bson::doc! {
+        "token": token_value,
+    };
+    let Some(user) = users.find_one(user_filter, None).await? else {
+        todo!()
+    };
+
+    // Make sure the task to delete belongs to the user
+    let tasks_data_copy = tasks_data.clone();
+    let task_filter = bson::doc! {
+        "_id": {
+            "$in": tasks_data_copy,
+        },
+    };
+    let mut tasks_cursor = tasks.find(task_filter, None).await?;
+    while let Some(task) = tasks_cursor.try_next().await? {
+        if task.user != Some(user._id) {
+            todo!()
+        };
+    }
 
     let filter = bson::doc!{"_id": { "$in": tasks_data }};
 
@@ -618,13 +848,40 @@ async fn delete_tasks_action(tasks_data: Vec<bson::oid::ObjectId>) -> Result<Del
     }
 }
 
-async fn delete_events_action(events_data: Vec<bson::oid::ObjectId>) -> Result<DeleteResult, Error> {
+async fn delete_events_action(token: Token<'_>, events_data: Vec<bson::oid::ObjectId>) -> Result<DeleteResult, Error> {
     let mut client_options = ClientOptions::parse("mongodb://localhost:27017").await?;
     client_options.app_name = Some("mossy".to_string());
     let client = Client::with_options(client_options)?;
     let db = client.database("mossy");
 
+    let users = db.collection::<User>("users");
     let events = db.collection::<Event>("events");
+
+    let mut token_split = token.clone().0.split(" ");
+    let Some(token_value) = token_split.nth(1) else {
+        todo!()
+    };
+
+    let user_filter = bson::doc! {
+        "token": token_value,
+    };
+    let Some(user) = users.find_one(user_filter, None).await? else {
+        todo!()
+    };
+
+    // Make sure the event to delete belongs to the user
+    let events_data_copy = events_data.clone();
+    let event_filter = bson::doc! {
+        "_id": {
+            "$in": events_data_copy,
+        },
+    };
+    let mut events_cursor = events.find(event_filter, None).await?;
+    while let Some(event) = events_cursor.try_next().await? {
+        if event.user != Some(user._id) {
+            todo!()
+        };
+    }
 
     let filter = bson::doc!{"_id": { "$in": events_data }};
 
@@ -636,13 +893,40 @@ async fn delete_events_action(events_data: Vec<bson::oid::ObjectId>) -> Result<D
     }
 }
 
-async fn delete_tags_action(tags_data: Vec<bson::oid::ObjectId>) -> Result<DeleteResult, Error> {
+async fn delete_tags_action(token: Token<'_>, tags_data: Vec<bson::oid::ObjectId>) -> Result<DeleteResult, Error> {
     let mut client_options = ClientOptions::parse("mongodb://localhost:27017").await?;
     client_options.app_name = Some("mossy".to_string());
     let client = Client::with_options(client_options)?;
     let db = client.database("mossy");
 
+    let users = db.collection::<User>("users");
     let tags = db.collection::<Tag>("tags");
+
+    let mut token_split = token.clone().0.split(" ");
+    let Some(token_value) = token_split.nth(1) else {
+        todo!()
+    };
+
+    let user_filter = bson::doc! {
+        "token": token_value,
+    };
+    let Some(user) = users.find_one(user_filter, None).await? else {
+        todo!()
+    };
+
+    // Make sure the tag to delete belongs to the user
+    let tags_data_copy = tags_data.clone();
+    let tag_filter = bson::doc! {
+        "_id": {
+            "$in": tags_data_copy,
+        },
+    };
+    let mut tags_cursor = tags.find(tag_filter, None).await?;
+    while let Some(tag) = tags_cursor.try_next().await? {
+        if tag.user != Some(user._id) {
+            todo!()
+        };
+    }
 
     let filter = bson::doc!{"_id": { "$in": tags_data }};
 
@@ -654,13 +938,34 @@ async fn delete_tags_action(tags_data: Vec<bson::oid::ObjectId>) -> Result<Delet
     }
 }
 
+#[derive(Debug, Clone)]
+struct Token<'r>(&'r str);
+
+#[derive(Debug)]
+enum TokenError {
+    Missing,
+}
+
+#[rocket::async_trait]
+impl<'r> FromRequest<'r> for Token<'r> {
+    type Error = TokenError;
+
+    async fn from_request(request: &'r Request<'_>) -> Outcome<Self, Self::Error> {
+        if let Some(token) = request.headers().get_one("Authorization") {
+            return Outcome::Success(Token(token))
+        } else {
+            return Outcome::Failure((Status::BadRequest, TokenError::Missing))
+        };
+    }
+}
+
 #[catch(500)]
 fn internal_error() -> &'static str {
     "The server encountered an internal error."
 }
 
 #[post("/api/log-in", format="json", data="<credentials>")]
-async fn log_in(credentials: Json<Credentials>) -> Result<Json<Claims>, Status> {
+async fn log_in(credentials: Json<Credentials>) -> Result<Json<User>, Status> {
     let deserialized_credentials = credentials.into_inner();
     let log_in_result = validate_credentials(deserialized_credentials).await;
 
@@ -686,8 +991,8 @@ async fn read_user(user: Json<UserData>) -> Result<Json<User>, Status> {
 }
 
 #[get("/api/tasks", format="json")]
-async fn read_tasks() -> Result<Json<Vec<TaskWithLatestEvent>>, Status> {
-    let tasks = read_tasks_action().await;
+async fn read_tasks(token: Token<'_>) -> Result<Json<Vec<TaskWithLatestEvent>>, Status> {
+    let tasks = read_tasks_action(token).await;
 
     match tasks {
         Ok(tasks_result) => Ok(Json(tasks_result)),
@@ -696,9 +1001,9 @@ async fn read_tasks() -> Result<Json<Vec<TaskWithLatestEvent>>, Status> {
 }
 
 #[post("/api/tasks", format="json", data="<task>")]
-async fn create_task(task: Json<NewTaskData>) -> Result<Json<InsertOneResult>, Status> {
+async fn create_task(token: Token<'_>, task: Json<NewTaskData>) -> Result<Json<InsertOneResult>, Status> {
     let deserialized_task = task.into_inner();
-    let task = create_task_action(deserialized_task).await;
+    let task = create_task_action(token, deserialized_task).await;
 
     match task {
         Ok(task_result) => Ok(Json(task_result)),
@@ -707,9 +1012,9 @@ async fn create_task(task: Json<NewTaskData>) -> Result<Json<InsertOneResult>, S
 }
 
 #[patch("/api/tasks", format="json", data="<task>")]
-async fn update_task(task: Json<Task>) -> Result<Json<UpdateResult>, Status> {
+async fn update_task(token: Token<'_>, task: Json<Task>) -> Result<Json<UpdateResult>, Status> {
     let deserialized_task = task.into_inner();
-    let task = update_task_action(deserialized_task).await;
+    let task = update_task_action(token, deserialized_task).await;
 
     match task {
         Ok(task_result) => Ok(Json(task_result)),
@@ -718,9 +1023,9 @@ async fn update_task(task: Json<Task>) -> Result<Json<UpdateResult>, Status> {
 }
 
 #[delete("/api/tasks", format="json", data="<tasks>")]
-async fn delete_tasks(tasks: Json<Vec<bson::oid::ObjectId>>) -> Result<Json<DeleteResult>, Status> {
+async fn delete_tasks(token: Token<'_>, tasks: Json<Vec<bson::oid::ObjectId>>) -> Result<Json<DeleteResult>, Status> {
     let deserialized_tasks_list = tasks.into_inner();
-    let tasks = delete_tasks_action(deserialized_tasks_list).await;
+    let tasks = delete_tasks_action(token, deserialized_tasks_list).await;
 
     match tasks {
         Ok(tasks_result) => Ok(Json(tasks_result)),
@@ -729,8 +1034,8 @@ async fn delete_tasks(tasks: Json<Vec<bson::oid::ObjectId>>) -> Result<Json<Dele
 }
 
 #[get("/api/events", format="json")]
-async fn read_events() -> Result<Json<Vec<Event>>, Status> {
-    let events = read_events_action().await;
+async fn read_events(token: Token<'_>) -> Result<Json<Vec<Event>>, Status> {
+    let events = read_events_action(token).await;
 
     match events {
         Ok(events_result) => Ok(Json(events_result)),
@@ -739,8 +1044,8 @@ async fn read_events() -> Result<Json<Vec<Event>>, Status> {
 }
 
 #[get("/api/events-string", format="json")]
-async fn read_events_string() -> Result<Json<Vec<EventWithStringValues>>, Status> {
-    let events = read_events_string_action().await;
+async fn read_events_string(token: Token<'_>) -> Result<Json<Vec<EventWithStringValues>>, Status> {
+    let events = read_events_string_action(token).await;
 
     match events {
         Ok(events_result) => Ok(Json(events_result)),
@@ -749,9 +1054,9 @@ async fn read_events_string() -> Result<Json<Vec<EventWithStringValues>>, Status
 }
 
 #[post("/api/events", format="json", data="<event>")]
-async fn create_event(event: Json<NewEventData>) -> Result<Json<InsertOneResult>, Status> {
+async fn create_event(token: Token<'_>, event: Json<NewEventData>) -> Result<Json<InsertOneResult>, Status> {
     let deserialized_event = event.into_inner();
-    let event = create_event_action(deserialized_event).await;
+    let event = create_event_action(token, deserialized_event).await;
 
     match event {
         Ok(event_result) => Ok(Json(event_result)),
@@ -760,9 +1065,9 @@ async fn create_event(event: Json<NewEventData>) -> Result<Json<InsertOneResult>
 }
 
 #[patch("/api/events", format="json", data="<event>")]
-async fn update_event(event: Json<EventWithStringValues>) -> Result<Json<UpdateResult>, Status> {
+async fn update_event(token: Token<'_>, event: Json<EventWithStringValues>) -> Result<Json<UpdateResult>, Status> {
     let deserialized_event = event.into_inner();
-    let event = update_event_action(deserialized_event).await;
+    let event = update_event_action(token, deserialized_event).await;
 
     match event {
         Ok(event_result) => Ok(Json(event_result)),
@@ -771,9 +1076,9 @@ async fn update_event(event: Json<EventWithStringValues>) -> Result<Json<UpdateR
 }
 
 #[delete("/api/events", format="json", data="<events>")]
-async fn delete_events(events: Json<Vec<bson::oid::ObjectId>>) -> Result<Json<DeleteResult>, Status> {
+async fn delete_events(token: Token<'_>, events: Json<Vec<bson::oid::ObjectId>>) -> Result<Json<DeleteResult>, Status> {
     let deserialized_events_list = events.into_inner();
-    let events = delete_events_action(deserialized_events_list).await;
+    let events = delete_events_action(token, deserialized_events_list).await;
 
     match events {
         Ok(events_result) => Ok(Json(events_result)),
@@ -782,8 +1087,8 @@ async fn delete_events(events: Json<Vec<bson::oid::ObjectId>>) -> Result<Json<De
 }
 
 #[get("/api/tags", format="json")]
-async fn read_tags() -> Result<Json<Vec<Tag>>, Status> {
-    let tags = read_tags_action().await;
+async fn read_tags(token: Token<'_>) -> Result<Json<Vec<Tag>>, Status> {
+    let tags = read_tags_action(token).await;
 
     match tags {
         Ok(tags_result) => Ok(Json(tags_result)),
@@ -792,9 +1097,9 @@ async fn read_tags() -> Result<Json<Vec<Tag>>, Status> {
 }
 
 #[post("/api/tags", format="json", data="<tag>")]
-async fn create_tag(tag: Json<NewTagData>) -> Result<Json<InsertOneResult>, Status> {
+async fn create_tag(token: Token<'_>, tag: Json<NewTagData>) -> Result<Json<InsertOneResult>, Status> {
     let deserialized_tag = tag.into_inner();
-    let tag = create_tag_action(deserialized_tag).await;
+    let tag = create_tag_action(token, deserialized_tag).await;
 
     match tag {
         Ok(tag_result) => Ok(Json(tag_result)),
@@ -803,9 +1108,9 @@ async fn create_tag(tag: Json<NewTagData>) -> Result<Json<InsertOneResult>, Stat
 }
 
 #[patch("/api/tags", format="json", data="<tag>")]
-async fn update_tag(tag: Json<Tag>) -> Result<Json<UpdateResult>, Status> {
+async fn update_tag(token: Token<'_>, tag: Json<Tag>) -> Result<Json<UpdateResult>, Status> {
     let deserialized_tag = tag.into_inner();
-    let tag = update_tag_action(deserialized_tag).await;
+    let tag = update_tag_action(token, deserialized_tag).await;
 
     match tag {
         Ok(tag_result) => Ok(Json(tag_result)),
@@ -814,9 +1119,9 @@ async fn update_tag(tag: Json<Tag>) -> Result<Json<UpdateResult>, Status> {
 }
 
 #[delete("/api/tags", format="json", data="<tags>")]
-async fn delete_tags(tags: Json<Vec<bson::oid::ObjectId>>) -> Result<Json<DeleteResult>, Status> {
+async fn delete_tags(token: Token<'_>, tags: Json<Vec<bson::oid::ObjectId>>) -> Result<Json<DeleteResult>, Status> {
     let deserialized_tags_list = tags.into_inner();
-    let tags = delete_tags_action(deserialized_tags_list).await;
+    let tags = delete_tags_action(token, deserialized_tags_list).await;
 
     match tags {
         Ok(tags_result) => Ok(Json(tags_result)),
