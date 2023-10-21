@@ -325,7 +325,7 @@ async fn validate_credentials(credentials: Credentials) -> Result<User, Credenti
     Ok(saved_user)
 }
 
-async fn read_user_action(user_data: UserData) -> Result<User, Error> {
+async fn read_user_action(token: Token<'_>, user_data: UserData) -> Result<User, Error> {
     let mut client_options = ClientOptions::parse("mongodb://localhost:27017").await?;
     client_options.app_name = Some("mossy".to_string());
     let client = Client::with_options(client_options)?;
@@ -333,8 +333,14 @@ async fn read_user_action(user_data: UserData) -> Result<User, Error> {
 
     let users = db.collection::<User>("users");
 
+    let mut token_split = token.clone().0.split(" ");
+    let Some(token_value) = token_split.nth(1) else {
+        todo!()
+    };
+
     let filter = bson::doc! {
         "apple_user_id": user_data.apple_user_id.clone(),
+        "token": token_value,
     };
 
     let user_option = match users.find_one(filter, None).await {
@@ -980,7 +986,7 @@ async fn log_in(credentials: Json<Credentials>) -> Result<Json<User>, Status> {
 }
 
 #[post("/api/user", format="json", data="<user>")]
-async fn read_user(user: Json<UserData>) -> Result<Json<User>, Status> {
+async fn read_user(token: Token<'_>, user: Json<UserData>) -> Result<Json<User>, Status> {
     let deserialized_user = user.into_inner();
     let user = read_user_action(deserialized_user).await;
 
