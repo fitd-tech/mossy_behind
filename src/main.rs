@@ -85,6 +85,18 @@ struct User {
     apple_user_id: String,
     token: String,
     is_admin: bool,
+    should_color_scheme_use_system: bool,
+    is_color_scheme_dark_mode: bool,
+    color_theme: u32,
+}
+
+#[derive(Serialize, Deserialize, Debug, Clone)]
+#[serde(crate = "rocket::serde")]
+struct UserThemeData {
+    apple_user_id: String,
+    should_color_scheme_use_system: bool,
+    is_color_scheme_dark_mode: bool,
+    color_theme: u32,
 }
 
 #[derive(Serialize, Deserialize, Debug)]
@@ -326,6 +338,9 @@ async fn validate_credentials(credentials: Credentials) -> Result<User, Credenti
             email: email_copy,
             apple_user_id: user_copy,
             token: token_create_user_copy,
+            should_color_scheme_use_system: false,
+            is_color_scheme_dark_mode: false,
+            color_theme: 1,
             is_admin: false,
         };
         let user_copy = user.clone();
@@ -380,6 +395,45 @@ async fn read_user_action(token: Token<'_>, user_data: UserData) -> Result<User,
         Ok(user)
     } else {
         todo!()
+    }
+}
+
+async fn update_user_theme_action(token: Token<'_>, user_theme_data: UserThemeData) -> Result<UpdateResult, Error> {
+    let mut client_options = ClientOptions::parse("mongodb://localhost:27017").await?;
+    client_options.app_name = Some("mossy".to_string());
+    let client = Client::with_options(client_options)?;
+    let db = client.database("mossy");
+
+    let users = db.collection::<User>("users");
+
+    let mut token_split = token.clone().0.split(" ");
+    let Some(token_value) = token_split.nth(1) else {
+        todo!()
+    };
+
+    let user_filter = bson::doc! {
+        "token": token_value,
+        "apple_user_id": user_theme_data.apple_user_id,
+    };
+    let Some(user) = users.find_one(user_filter, None).await? else {
+        todo!()
+    };
+
+    let updated_user = bson::doc! {
+        "$set": {
+            "should_color_scheme_use_system": user_theme_data.should_color_scheme_use_system,
+            "is_color_scheme_dark_mode": user_theme_data.is_color_scheme_dark_mode,
+            "color_theme": user_theme_data.color_theme,
+        }
+    };
+
+    let filter = bson::doc!{"_id": user._id };
+
+    let user_result = users.update_one(filter, updated_user, None).await;
+
+    match user_result {
+        Ok(_user_result) => Ok(_user_result),
+        Err(_) => todo!(),
     }
 }
 
@@ -1366,6 +1420,17 @@ async fn read_user(token: Token<'_>, user: Json<UserData>) -> Result<Json<User>,
     }
 }
 
+#[patch("/api/user/theme", format="json", data="<theme_data>")]
+async fn update_user_theme(token: Token<'_>, theme_data: Json<UserThemeData>) -> Result<Json<UpdateResult>, Status> {
+    let deserialized_theme = theme_data.into_inner();
+    let theme_result = update_user_theme_action(token, deserialized_theme).await;
+
+    match theme_result {
+        Ok(_theme) => Ok(Json(_theme)),
+        Err(_) => Err(Status::InternalServerError),
+    }
+}
+
 #[get("/api/tasks?<limit>&<offset>", format="json")]
 async fn read_tasks(token: Token<'_>, limit: Option<u32>, offset: Option<u32>) -> Result<Json<Vec<Document>>, Status> {
     let params = ReadParams {
@@ -1590,6 +1655,7 @@ fn rocket() -> _ {
         .mount("/", routes![index])
         .mount("/", routes![log_in])
         .mount("/", routes![read_user])
+        .mount("/", routes![update_user_theme])
         .mount("/", routes![read_tasks])
         .mount("/", routes![create_task])
         .mount("/", routes![update_task])
