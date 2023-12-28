@@ -177,6 +177,13 @@ struct NewEventData {
 
 #[derive(Serialize, Deserialize, Debug)]
 #[serde(crate = "rocket::serde")]
+struct UpdateEventData {
+    _id: bson::oid::ObjectId,
+    date: String,
+}
+
+#[derive(Serialize, Deserialize, Debug)]
+#[serde(crate = "rocket::serde")]
 struct DebugCreateTasksData {
     quantity: u8,
 }
@@ -880,7 +887,7 @@ async fn update_task_action(token: Token<'_>, task_data: Task) -> Result<UpdateR
     }
 }
 
-async fn update_event_action(token: Token<'_>, event_data: EventWithStringValues) -> Result<UpdateResult, Error> {
+async fn update_event_action(token: Token<'_>, event_data: UpdateEventData) -> Result<UpdateResult, Error> {
     let mut client_options = ClientOptions::parse("mongodb://localhost:27017").await?;
     client_options.app_name = Some("mossy".to_string());
     let client = Client::with_options(client_options)?;
@@ -912,9 +919,13 @@ async fn update_event_action(token: Token<'_>, event_data: EventWithStringValues
         todo!()
     };
 
+    let date = match bson::DateTime::parse_rfc3339_str(event_data.date) {
+        Ok(_date) => _date,
+        Err(_date) => todo!()
+    };
     let updated_event = bson::doc! {
         "$set": {
-            "date": event_data.date,
+            "date": date,
         }
     };
 
@@ -1518,7 +1529,7 @@ async fn create_event(token: Token<'_>, event: Json<NewEventData>) -> Result<Jso
 }
 
 #[patch("/api/events", format="json", data="<event>")]
-async fn update_event(token: Token<'_>, event: Json<EventWithStringValues>) -> Result<Json<UpdateResult>, Status> {
+async fn update_event(token: Token<'_>, event: Json<UpdateEventData>) -> Result<Json<UpdateResult>, Status> {
     let deserialized_event = event.into_inner();
     let event = update_event_action(token, deserialized_event).await;
 
