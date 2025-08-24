@@ -15,6 +15,7 @@ rsa = "0.9"
 jsonwebtoken = "8.3"
 jwt = "0.16"
 dotenv = "0.15"
+random_word = { version = "0.5.0", features = ["en"] }
 
 [dependencies.mongodb]
 version = "2.6.0"
@@ -26,6 +27,7 @@ version = "=0.5.0-rc.3"
 features = ["json"]
 
 [dependencies.bson]
+version = "2.6.1"
 features = ["chrono-0_4"]
 
 [dependencies.reqwest]

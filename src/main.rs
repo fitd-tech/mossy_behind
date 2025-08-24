@@ -4,17 +4,20 @@ use mongodb::results::{InsertOneResult, DeleteResult, UpdateResult, InsertManyRe
 use mongodb::{Client, options::ClientOptions};
 use mongodb::error::Error;
 use futures::stream::TryStreamExt;
-use rocket::http::Status;
+use rocket::http::{Status, Header, Method};
 use rocket::request::{Request, Outcome, FromRequest};
 use rocket::serde::{Serialize, Deserialize, json::Json};
 use mongodb::bson;
 use mongodb::options::FindOptions;
 use reqwest;
-use reqwest::Error as ReqwestError;
+// use reqwest::Error as ReqwestError;
 use base64::{Engine as _, engine::general_purpose};
 use jsonwebtoken;
 use jsonwebtoken::{DecodingKey, Validation, Algorithm};
 use dotenv;
+use rocket::fairing::{Fairing, Info, Kind};
+use rocket::Response;
+use random_word::Lang;
 
 // https://www.mongodb.com/developer/languages/rust/serde-improvements/
 
@@ -32,7 +35,8 @@ struct Credentials {
     authorization_code: String,
     identity_token: String,
     nonce: String,
-    user: String,
+    // user: String,
+    source: Option<String>,
 }
 
 #[derive(Serialize, Deserialize, Debug)]
@@ -71,7 +75,7 @@ struct Claims {
     sub: String,
     c_hash: String,
     email: String,
-    email_verified: String,
+    email_verified: bool, // String,
     auth_time: i64,
     nonce_supported: bool,
     nonce: Option<String>,
@@ -139,6 +143,7 @@ struct Task {
     frequency: i32,
     tags: Option<Vec<bson::oid::ObjectId>>,
     user: Option<bson::oid::ObjectId>,
+    created: Option<bson::DateTime>,
 }
 
 #[derive(Serialize, Deserialize, Debug)]
@@ -209,7 +214,7 @@ struct ReadParams {
 
 #[derive(Debug)]
 enum CredentialsError {
-    FetchKeysError(ReqwestError),
+    FetchKeysError, // (ReqwestError),
     DotEnvError,
     NoClientIdError,
     NoDbAddressError,
@@ -236,7 +241,7 @@ async fn index() -> &'static str {
 async fn validate_credentials(credentials: Credentials) -> Result<User, CredentialsError> {
     let keys_response = match reqwest::get("https://appleid.apple.com/auth/keys").await {
         Ok(_keys_response) => _keys_response,
-        Err(_keys_response) => return Err(CredentialsError::FetchKeysError(_keys_response))
+        Err(_keys_response) => return Err(CredentialsError::FetchKeysError) // (_keys_response))
     };
     let deserialized_keys_response = match keys_response.json::<AppleAuthResponse>().await {
         Ok(_deserialized_keys_response) => _deserialized_keys_response,
@@ -255,10 +260,29 @@ async fn validate_credentials(credentials: Credentials) -> Result<User, Credenti
         Ok(_dotenv_result) => _dotenv_result,
         Err(_) => return Err(CredentialsError::DotEnvError),
     };
-    let apple_client_id = match dotenv::var("APPLE_CLIENT_ID") {
+    let apple_client_id;
+    if let Some(credential_source) = credentials.source {
+        if credential_source == "web" {
+            apple_client_id = match dotenv::var("MOSSY_APPLE_SIGN_IN_CLIENT_ID") {
+                Ok(_apple_client_id) => _apple_client_id,
+                Err(_) => return Err(CredentialsError::NoClientIdError)
+            };
+        } else {
+            apple_client_id = match dotenv::var("EXPO_APPLE_SIGN_IN_CLIENT_ID") {
+                Ok(_apple_client_id) => _apple_client_id,
+                Err(_) => return Err(CredentialsError::NoClientIdError)
+            };
+        }
+    } else {
+        apple_client_id = match dotenv::var("EXPO_APPLE_SIGN_IN_CLIENT_ID") {
+            Ok(_apple_client_id) => _apple_client_id,
+            Err(_) => return Err(CredentialsError::NoClientIdError)
+        };
+    }
+    /* let apple_client_id = match dotenv::var("APPLE_CLIENT_ID") {
         Ok(_apple_client_id) => _apple_client_id,
         Err(_) => return Err(CredentialsError::NoClientIdError)
-    };
+    }; */
 
     // We can specify validation predicates here per this list:
     // https://developer.apple.com/documentation/sign_in_with_apple/sign_in_with_apple_rest_api/verifying_a_user
@@ -270,6 +294,7 @@ async fn validate_credentials(credentials: Credentials) -> Result<User, Credenti
     let Some(matching_key) = keys_iterator.find(|key| key.kid == credential_kid) else {
         return Err(CredentialsError::NoMatchingKidError)
     };
+    println!("matching_key {:?}", matching_key);
 
     // Make sure an invalid key fails, if one exists in the response
     if let Some(invalid_key) = keys_iterator.find(|key| key.kid != credential_kid) {
@@ -297,9 +322,15 @@ async fn validate_credentials(credentials: Credentials) -> Result<User, Credenti
         Err(_decoded_e) => return Err(CredentialsError::DecodeComponentError)
     };
     let decoding_key = DecodingKey::from_rsa_raw_components(&decoded_n, &decoded_e);
+    println!("credentials.identity_token {:?}", credentials.identity_token);
+    // println!("decoding_key {:?}", decoding_key);
+    println!("validation {:?}", validation);
     let claims = match jsonwebtoken::decode::<Claims>(&credentials.identity_token, &decoding_key, &validation) {
         Ok(_claims) => _claims,
-        Err(_claims) => return Err(CredentialsError::MatchingKeyFailedError),
+        Err(_claims) => {
+            println!("_claims from Err {:?}", _claims);
+            return Err(CredentialsError::MatchingKeyFailedError)
+        }
     };
 
     let Some(claims_nonce) = &claims.claims.nonce else {
@@ -328,7 +359,8 @@ async fn validate_credentials(credentials: Credentials) -> Result<User, Credenti
     let users = db.collection::<User>("users");
 
     let filter = bson::doc! {
-        "apple_user_id": credentials.user.clone(),
+        // "apple_user_id": credentials.user.clone(),
+        "apple_user_id": claims.claims.sub.clone(),
     };
     let existing_user_option = match users.find_one(filter, None).await {
         Ok(_existing_user) => _existing_user,
@@ -339,7 +371,8 @@ async fn validate_credentials(credentials: Credentials) -> Result<User, Credenti
     let token_update_user_copy = token.clone();
     let saved_user = if existing_user_option.is_none() {
         let email_copy = claims.claims.email.clone();
-        let user_copy = credentials.user.clone();
+        // let user_copy = credentials.user.clone();
+        let user_copy = claims.claims.sub.clone();
         let user = User {
             _id: bson::oid::ObjectId::new(),
             email: email_copy,
@@ -375,7 +408,8 @@ async fn validate_credentials(credentials: Credentials) -> Result<User, Credenti
     Ok(saved_user)
 }
 
-async fn read_user_action(token: Token<'_>, user_data: UserData) -> Result<User, Error> {
+async fn read_user_action(token: Token<'_>, user_data: UserData) -> Result<Option<User>, Error> {
+    println!("user_data {:?}", user_data);
     let mut client_options = ClientOptions::parse("mongodb://localhost:27017").await?;
     client_options.app_name = Some("mossy".to_string());
     let client = Client::with_options(client_options)?;
@@ -395,13 +429,13 @@ async fn read_user_action(token: Token<'_>, user_data: UserData) -> Result<User,
 
     let user_option = match users.find_one(filter, None).await {
         Ok(_user) => _user,
-        Err(_) => todo!()
+        Err(_) => None
     };
 
     if let Some(user) = user_option {
-        Ok(user)
+        Ok(Some(user))
     } else {
-        todo!()
+       Ok(None)
     }
 }
 
@@ -444,6 +478,57 @@ async fn update_user_theme_action(token: Token<'_>, user_theme_data: UserThemeDa
     }
 }
 
+async fn read_tasks_for_tag_action(token: Token<'_>, tag_id: bson::oid::ObjectId) ->Result<Vec<Task>, Error> {
+    let mut client_options = ClientOptions::parse("mongodb://localhost:27017").await?;
+    client_options.app_name = Some("mossy".to_string());
+    let client = Client::with_options(client_options)?;
+    let db = client.database("mossy");
+
+    let users = db.collection::<User>("users");
+    let tags = db.collection::<Tag>("tags");
+    let tasks = db.collection::<Task>("tasks");
+
+    let mut token_split = token.clone().0.split(" ");
+    let Some(token_value) = token_split.nth(1) else {
+        todo!()
+    };
+    println!("token_value from read_tasks_for_tag_action {:?}", token_value);
+
+    let user_filter = bson::doc! {
+        "token": token_value,
+    };
+    let Some(user) = users.find_one(user_filter, None).await? else {
+        todo!()
+    };
+
+    let tag_filter = bson::doc! {
+        "_id": Some(tag_id),
+    };
+    let Some(tag) = tags.find_one(tag_filter, None).await? else {
+        todo!()
+    };
+
+    let tasks_filter = bson::doc! {
+        "tags": tag_id,
+        "user": user._id,
+    };
+    let sort_option = bson::doc! {
+        "name": 1,
+        "_id": -1,
+    };
+    let options = FindOptions::builder().sort(sort_option).build();
+    let mut cursor = tasks.find(tasks_filter, options).await?;
+
+    let mut tasks_list = Vec::new();
+
+    // DEV: we can use try_collect here instead?
+    while let Some(task) = cursor.try_next().await? {
+        tasks_list.push(task);
+    }
+
+    Ok(tasks_list)
+}
+
 async fn read_tasks_action(token: Token<'_>, params: ReadParams) -> Result<Vec<Document>, Error> {
     let limit = params.limit.unwrap_or(0);
     let offset = params.offset.unwrap_or(0);
@@ -460,6 +545,7 @@ async fn read_tasks_action(token: Token<'_>, params: ReadParams) -> Result<Vec<D
     let Some(token_value) = token_split.nth(1) else {
         todo!()
     };
+    println!("token_value from read_tasks_action {:?}", token_value);
 
     let user_filter = bson::doc! {
         "token": token_value,
@@ -472,7 +558,7 @@ async fn read_tasks_action(token: Token<'_>, params: ReadParams) -> Result<Vec<D
         bson::doc! {
             "$match": {
                 "user": user._id,
-            }
+            },
         },
         bson::doc! {
             "$lookup": {
@@ -484,71 +570,95 @@ async fn read_tasks_action(token: Token<'_>, params: ReadParams) -> Result<Vec<D
         },
         bson::doc! {
             "$set": {
-            "event_mapping": {
-                "$sortArray": {
-                "input": "$event_mapping",
-                "sortBy": {
-                    "date": -1
+                "event_mapping": {
+                    "$sortArray": {
+                        "input": "$event_mapping",
+                        "sortBy": {
+                            "date": -1
+                        },
+                    },
+                },
+            },
+        },
+        bson::doc! {
+            "$set": {
+                "event_mapping": {
+                    "$first": "$event_mapping"
+                },
+            },
+        },
+        bson::doc! {
+            "$set": {
+                "latest_event_date": "$event_mapping.date",
+                "time_since_latest_event": {
+                    "$dateDiff": {
+                        "startDate": "$event_mapping.date",
+                        "endDate": bson::DateTime::now(),
+                        "unit": "millisecond",
+                    },
+                },
+                "time_since_created": {
+                    "$dateDiff": {
+                        "startDate": "$created",
+                        "endDate": bson::DateTime::now(),
+                        "unit": "millisecond",
+                    },
+                },
+            },
+        },
+        bson::doc! {
+            "$set": {
+                "frequency_in_milliseconds_raw": {
+                    "$multiply": [
+                        1000,
+                        60,
+                        60,
+                        24,
+                        "$frequency"
+                    ]
                 }
+            }
+        },
+        bson::doc! {
+            "$set": {
+                "frequency_in_milliseconds": {
+                    "$toLong": "$frequency_in_milliseconds_raw"
                 }
             }
-            }
         },
         bson::doc! {
             "$set": {
-            "event_mapping": {
-                "$first": "$event_mapping"
-            }
-            }
-        },
-        bson::doc! {
-            "$set": {
-            "latest_event_date": "$event_mapping.date",
-            "time_since_latest_event": {
-                "$dateDiff": {
-                "startDate": "$event_mapping.date",
-                "endDate": bson::DateTime::now(),
-                "unit": "millisecond",
-                }
-            }
-            }
-        },
-        bson::doc! {
-            "$set": {
-            "frequency_in_milliseconds_raw": {
-                "$multiply": [
-                1000,
-                60,
-                60,
-                24,
-                "$frequency"
-                ]
-            }
-            }
-        },
-        bson::doc! {
-            "$set": {
-            "frequency_in_milliseconds": {
-                "$toLong": "$frequency_in_milliseconds_raw"
-            }
-            }
-        },
-        bson::doc! {
-            "$set": {
-            "moss": {
-                "$subtract": [
-                "$time_since_latest_event",
-                "$frequency_in_milliseconds"
-                ]
-            }
-            }
+                "moss": {
+                    "$cond": [
+                        { 
+                            "$eq": [
+                                "$time_since_last_event",
+                                "null",
+                            ],
+                        },
+                        { // TODO: We can allow the user to set a start date
+                            "$subtract": [
+                                "$time_since_created",
+                                "$frequency_in_milliseconds",
+                            ],
+                        },
+                        { 
+                            "$subtract": [
+                                "$time_since_latest_event",
+                                "$frequency_in_milliseconds",
+                            ],
+                        },
+                    ],
+                },
+            },
         },
         bson::doc! {
             "$unset": [
                 "event_mapping",
                 "frequency_in_milliseconds_raw",
                 "frequency_in_milliseconds",
-            ]
+                "time_since_created",
+            ],
         },
         bson::doc! {
             // We also need to sort by a unique value (_id) to ensure we don't get duplicates in pagination
@@ -556,7 +666,7 @@ async fn read_tasks_action(token: Token<'_>, params: ReadParams) -> Result<Vec<D
             "$sort": {
                 "moss": -1,
                 "_id": -1,
-            }
+            },
         },
         bson::doc! {
             "$skip": offset
@@ -636,6 +746,7 @@ async fn read_events_string_action(token: Token<'_>, params: ReadParams) ->Resul
     let Some(token_value) = token_split.nth(1) else {
         todo!()
     };
+    println!("token_value from read_events_string_action {:?}", token_value);
 
     let user_filter = bson::doc! {
         "token": token_value,
@@ -680,6 +791,59 @@ async fn read_events_string_action(token: Token<'_>, params: ReadParams) ->Resul
     Ok(events_list)
 }
 
+async fn read_tags_for_task_action(token: Token<'_>, task_id: bson::oid::ObjectId) ->Result<Vec<Tag>, Error> {
+    let mut client_options = ClientOptions::parse("mongodb://localhost:27017").await?;
+    client_options.app_name = Some("mossy".to_string());
+    let client = Client::with_options(client_options)?;
+    let db = client.database("mossy");
+
+    let users = db.collection::<User>("users");
+    let tasks = db.collection::<Task>("tasks");
+    let tags = db.collection::<Tag>("tags");
+
+    let mut token_split = token.clone().0.split(" ");
+    let Some(token_value) = token_split.nth(1) else {
+        todo!()
+    };
+    println!("token_value from read_tags_for_task_action {:?}", token_value);
+
+    let user_filter = bson::doc! {
+        "token": token_value,
+    };
+    let Some(user) = users.find_one(user_filter, None).await? else {
+        todo!()
+    };
+
+    let task_filter = bson::doc! {
+        "_id": Some(task_id),
+    };
+    let Some(task) = tasks.find_one(task_filter, None).await? else {
+        todo!()
+    };
+
+    let tags_filter = bson::doc! {
+        "_id": {
+            "$in": task.tags,
+        },
+        "user": user._id,
+    };
+    let sort_option = bson::doc! {
+        "name": 1,
+        "_id": -1,
+    };
+    let options = FindOptions::builder().sort(sort_option).build();
+    let mut cursor = tags.find(tags_filter, options).await?;
+
+    let mut tags_list = Vec::new();
+
+    // DEV: we can use try_collect here instead?
+    while let Some(tag) = cursor.try_next().await? {
+        tags_list.push(tag);
+    }
+
+    Ok(tags_list)
+}
+
 async fn read_tags_action(token: Token<'_>, params: ReadParams) ->Result<Vec<Tag>, Error> {
     let limit = params.limit.unwrap_or(0);
     let offset = params.offset.unwrap_or(0);
@@ -696,6 +860,7 @@ async fn read_tags_action(token: Token<'_>, params: ReadParams) ->Result<Vec<Tag
     let Some(token_value) = token_split.nth(1) else {
         todo!()
     };
+    println!("token_value from read_tags_action {:?}", token_value);
 
     let user_filter = bson::doc! {
         "token": token_value,
@@ -750,6 +915,7 @@ async fn create_task_action(token: Token<'_>, task_data: NewTaskData) -> Result<
         frequency: task_data.frequency,
         tags: task_data.tags,
         user: Some(user._id),
+        created: Some(bson::DateTime::now()),
     };
 
     let task_result = tasks.insert_one(new_task, None).await;
@@ -1160,6 +1326,7 @@ async fn debug_create_tasks_action(token: Token<'_>, data: DebugCreateTasksData)
             frequency: 7,
             tags: None,
             user: Some(user._id),
+            created: Some(bson::DateTime::now()),
         };
         new_tasks.push(new_task);
         iteration += 1;
@@ -1327,7 +1494,7 @@ async fn debug_create_tags_action(token: Token<'_>, data: DebugCreateTagsData) -
     while iteration < quantity_to_create {
         let new_tag = Tag {
             _id: bson::oid::ObjectId::new(),
-            name: String::from(iteration.to_string()),
+            name: random_word::get(Lang::En).to_string(),
             description: None,
             parent_tag: None,
             user: Some(user._id),
@@ -1421,7 +1588,7 @@ async fn log_in(credentials: Json<Credentials>) -> Result<Json<User>, Status> {
 }
 
 #[post("/api/user", format="json", data="<user>")]
-async fn read_user(token: Token<'_>, user: Json<UserData>) -> Result<Json<User>, Status> {
+async fn read_user(token: Token<'_>, user: Json<UserData>) -> Result<Json<Option<User>>, Status> {
     let deserialized_user = user.into_inner();
     let user = read_user_action(token, deserialized_user).await;
 
@@ -1438,6 +1605,22 @@ async fn update_user_theme(token: Token<'_>, theme_data: Json<UserThemeData>) ->
 
     match theme_result {
         Ok(_theme) => Ok(Json(_theme)),
+        Err(_) => Err(Status::InternalServerError),
+    }
+}
+
+#[get("/api/tasks/tag?<tag_id>", format="json")]
+async fn read_tasks_for_tag(token: Token<'_>, tag_id: String) -> Result<Json<Vec<Task>>, Status> {
+    let tag_id_result = bson::oid::ObjectId::parse_str(tag_id);
+    let tag_id = match tag_id_result {
+        Ok(tag_id) => tag_id,
+        Err(_) => return Err(Status::InternalServerError),
+    };
+
+    let tasks = read_tasks_for_tag_action(token, tag_id).await;
+
+    match tasks {
+        Ok(tasks_result) => Ok(Json(tasks_result)),
         Err(_) => Err(Status::InternalServerError),
     }
 }
@@ -1481,6 +1664,7 @@ async fn update_task(token: Token<'_>, task: Json<Task>) -> Result<Json<UpdateRe
 #[delete("/api/tasks", format="json", data="<tasks>")]
 async fn delete_tasks(token: Token<'_>, tasks: Json<Vec<bson::oid::ObjectId>>) -> Result<Json<DeleteResult>, Status> {
     let deserialized_tasks_list = tasks.into_inner();
+    println!("deserialized_tasks_list from delete_tasks {:?}", deserialized_tasks_list);
     let tasks = delete_tasks_action(token, deserialized_tasks_list).await;
 
     match tasks {
@@ -1546,6 +1730,22 @@ async fn delete_events(token: Token<'_>, events: Json<Vec<bson::oid::ObjectId>>)
 
     match events {
         Ok(events_result) => Ok(Json(events_result)),
+        Err(_) => Err(Status::InternalServerError),
+    }
+}
+
+#[get("/api/tags/task?<task_id>", format="json")]
+async fn read_tags_for_task(token: Token<'_>, task_id: String) -> Result<Json<Vec<Tag>>, Status> {
+    let task_id_result = bson::oid::ObjectId::parse_str(task_id);
+    let task_id = match task_id_result {
+        Ok(task_id) => task_id,
+        Err(_) => return Err(Status::InternalServerError),
+    };
+
+    let tags = read_tags_for_task_action(token, task_id).await;
+
+    match tags {
+        Ok(tags_result) => Ok(Json(tags_result)),
         Err(_) => Err(Status::InternalServerError),
     }
 }
@@ -1659,6 +1859,39 @@ async fn debug_delete_tags(token: Token<'_>) -> Result<Json<DeleteResult>, Statu
     }
 }
 
+// Create a fairing to handle CORS
+// https://stackoverflow.com/a/64904947/16410174
+// https://github.com/rwf2/Rocket/issues/2142#issuecomment-1086660848
+pub struct CORS;
+
+#[rocket::async_trait]
+impl Fairing for CORS {
+    fn info(&self) -> Info {
+        Info {
+            name: "Add CORS headers to responses",
+            kind: Kind::Response
+        }
+    }
+
+    async fn on_response<'r>(&self, _request: &'r Request<'_>, response: &mut Response<'r>) {
+        if _request.method() == Method::Options {
+            response.set_status(Status::NoContent);
+            response.set_header(Header::new(
+                "Access-Control-Allow-Methods",
+                "POST, PATCH, GET, DELETE",
+            ));
+            response.set_header(Header::new(
+                "Access-Control-Allow-Headers",
+                "content-type, authorization",
+            ));
+        }
+        response.set_header(Header::new("Access-Control-Allow-Origin", "*"));
+        response.set_header(Header::new("Access-Control-Allow-Methods", "POST, GET, PATCH, OPTIONS"));
+        response.set_header(Header::new("Access-Control-Allow-Headers", "*"));
+        response.set_header(Header::new("Access-Control-Allow-Credentials", "true"));
+    }
+}
+
 #[launch]
 fn rocket() -> _ {
     rocket::build()
@@ -1667,6 +1900,7 @@ fn rocket() -> _ {
         .mount("/", routes![log_in])
         .mount("/", routes![read_user])
         .mount("/", routes![update_user_theme])
+        .mount("/", routes![read_tasks_for_tag])
         .mount("/", routes![read_tasks])
         .mount("/", routes![create_task])
         .mount("/", routes![update_task])
@@ -1676,6 +1910,7 @@ fn rocket() -> _ {
         .mount("/", routes![create_event])
         .mount("/", routes![update_event])
         .mount("/", routes![delete_events])
+        .mount("/", routes![read_tags_for_task])
         .mount("/", routes![read_tags])
         .mount("/", routes![create_tag])
         .mount("/", routes![update_tag])
@@ -1686,4 +1921,5 @@ fn rocket() -> _ {
         .mount("/", routes![debug_delete_events])
         .mount("/", routes![debug_create_tags])
         .mount("/", routes![debug_delete_tags])
+        .attach(CORS)
 }
